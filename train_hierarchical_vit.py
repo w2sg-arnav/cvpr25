@@ -9,12 +9,14 @@ from sklearn.metrics import classification_report
 import os
 import numpy as np
 import math
+import matplotlib.pyplot as plt
+from torchvision import transforms
 
 # Define CustomDataset class with multimodal support
 class CustomDataset(Dataset):
     def __init__(self, data, use_multimodal=False, transform=None):
         self.data = data.data  # Access the underlying list of (image, label) tuples
-        self.use_multimodal = use_multimodal
+        self.use_multimodal = use_multimodal  # Initialize the attribute
         self.transform = transform
     
     def __len__(self):
@@ -46,14 +48,29 @@ class CustomDataset(Dataset):
                 image = torch.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
             return image, label
 
+# Define calculate_class_weights function
+def calculate_class_weights(dataset):
+    class_counts = np.zeros(7)  # Assuming 7 classes based on num_classes
+    for _, label in dataset.data:
+        class_counts[label] += 1
+    total_samples = np.sum(class_counts)
+    class_counts[class_counts == 0] = 1  # Avoid division by zero
+    class_weights = total_samples / (len(class_counts) * class_counts)
+    return torch.FloatTensor(class_weights).to(device)
+
 # Step 1: Set Up the Environment and Load Data
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 checkpoint = torch.load('dataset_splits.pth')
-combined_train_dataset = checkpoint['train_dataset']
-val_dataset = checkpoint['val_dataset']
-test_dataset = checkpoint['test_dataset']
+# Recreate datasets with explicit use_multimodal and adjusted transform
+transform = transforms.Compose([
+    # Remove ToTensor since data is already a tensor
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize tensor data
+])
+combined_train_dataset = CustomDataset(checkpoint['train_dataset'], use_multimodal=False, transform=transform)
+val_dataset = CustomDataset(checkpoint['val_dataset'], use_multimodal=False, transform=transform)
+test_dataset = CustomDataset(checkpoint['test_dataset'], use_multimodal=False, transform=transform)
 
 # Check if multimodal data is available
 has_multimodal = False
@@ -328,8 +345,9 @@ scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
 
 num_epochs = 30
 best_val_loss = float('inf')
-best_model_path = 'best_finetuned_hierarchical_vit.pth'
-patience = 5
+best_model_path = 'best_hierarchical_vit.pth'
+patience = 8
+
 trigger_times = 0
 
 for epoch in range(num_epochs):

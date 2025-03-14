@@ -367,8 +367,6 @@ torch.save({
     'augmented_stats': augmented_stats
 }, os.path.join(SAVE_PATH, 'preprocessed_data.pth'))
 
-print("Data preprocessing completed and saved.)
-
 # Print dataset statistics
 print(f"\nTraining set size: {len(train_multimodal_dataset)}")
 print(f"Validation set size: {len(val_multimodal_dataset)}")
