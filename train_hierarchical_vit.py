@@ -138,7 +138,8 @@ class HierarchicalVisionTransformer(nn.Module):
                  heads=[4, 8, 16], 
                  mlp_ratio=4.0,
                  multimodal_support=False,
-                 spectral_channels=0):
+                 spectral_channels=0,
+                 pretrained=False):
         super(HierarchicalVisionTransformer, self).__init__()
 
         assert image_size % patch_size == 0, "Image size must be divisible by patch size"
@@ -218,15 +219,22 @@ class HierarchicalVisionTransformer(nn.Module):
         # Output layers
         self.norm = nn.LayerNorm(self.stage_dims[-1])
         self.dropout = nn.Dropout(0.1)
-        self.head = nn.Linear(self.stage_dims[-1], num_classes)
+        
+        # Classification head (replaces projection head from SimCLR)
+        if pretrained:
+            # If pretrained, the projection head will be discarded and replaced
+            self.head = nn.Linear(self.stage_dims[-1], num_classes)
+        else:
+            self.head = nn.Linear(self.stage_dims[-1], num_classes)
         
         # Additional classifier for explainability
         self.aux_classifiers = nn.ModuleList([
             nn.Linear(dim, num_classes) for dim in self.stage_dims
         ])
         
-        # Initialize weights
-        self.apply(self._init_weights)
+        # Initialize weights (only if not loading pretrained weights)
+        if not pretrained:
+            self.apply(self._init_weights)
         
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -303,6 +311,7 @@ class HierarchicalVisionTransformer(nn.Module):
             # Return only main output during inference
             return x
 
+# Initialize model with pretrained weights
 spectral_channels = 0
 if has_multimodal:
     try:
@@ -321,33 +330,48 @@ model = HierarchicalVisionTransformer(
     heads=[4, 8, 16],
     mlp_ratio=4.0,
     multimodal_support=True,
-    spectral_channels=spectral_channels
+    spectral_channels=spectral_channels,
+    pretrained=True  # Indicate that we are loading pretrained weights
 )
 
-pretrained_path = '/teamspace/studios/this_studio/best_hierarchical_vit.pth'
+# Load pretrained weights from SimCLR
+pretrained_path = '/teamspace/studios/this_studio/best_simclr_pretrained.pth'
 if os.path.exists(pretrained_path):
-    state_dict = torch.load(pretrained_path)
+    pretrained_state_dict = torch.load(pretrained_path)
+    model_dict = model.state_dict()
+    # Filter out the projection head (not needed for fine-tuning)
+    pretrained_state_dict = {k: v for k, v in pretrained_state_dict.items() if k in model_dict and 'projection_head' not in k}
+    model_dict.update(pretrained_state_dict)
+    model.load_state_dict(model_dict, strict=False)
+    print(f"Loaded pretrained weights from {pretrained_path} with strict=False")
+else:
+    print(f"Warning: Pretrained model {pretrained_path} not found. Training from scratch.")
+    # If pretrained weights are not found, initialize weights
+    model.apply(model._init_weights)
+
+# Load previous supervised weights if available (optional, comment out if not needed)
+supervised_pretrained_path = '/teamspace/studios/this_studio/best_hierarchical_vit.pth'
+if os.path.exists(supervised_pretrained_path):
+    state_dict = torch.load(supervised_pretrained_path)
     model_dict = model.state_dict()
     state_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
     model_dict.update(state_dict)
     model.load_state_dict(model_dict, strict=False)
-    print(f"Loaded partial pretrained weights from {pretrained_path} with strict=False")
-else:
-    print(f"Warning: Pretrained model {pretrained_path} not found. Training from scratch.")
+    print(f"Loaded partial supervised pretrained weights from {supervised_pretrained_path} with strict=False")
+
 model = model.to(device)
 
 train_class_weights = calculate_class_weights(combined_train_dataset)
 print("Class weights:", train_class_weights)
 
 criterion = nn.CrossEntropyLoss(weight=train_class_weights)
-optimizer = Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
+optimizer = Adam(model.parameters(), lr=0.00003, weight_decay=1e-4)  # Lower LR for fine-tuning
 scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
 
 num_epochs = 30
 best_val_loss = float('inf')
-best_model_path = 'best_hierarchical_vit.pth'
+best_model_path = 'best_hierarchical_vit_finetuned.pth'
 patience = 8
-
 trigger_times = 0
 
 for epoch in range(num_epochs):
@@ -512,7 +536,7 @@ for i in range(min(explainability_samples, len(test_dataset))):
     plt.axis('off')
 
 plt.tight_layout()
-plt.savefig('model_predictions.png')
+plt.savefig('model_predictions_finetuned.png')
 print("Saved sample predictions visualization")
 
 torch.save({
@@ -520,5 +544,5 @@ torch.save({
     'class_names': class_names,
     'test_accuracy': test_accuracy,
     'classification_report': classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
-}, 'hierarchical_vit_results.pth')
+}, 'hierarchical_vit_finetuned_results.pth')
 print("Saved complete model results")
