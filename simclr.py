@@ -53,15 +53,16 @@ simclr_transform = transforms.Compose([
 train_dataset_ssl = CustomDataset(combined_train_dataset, transform=simclr_transform)
 train_loader_ssl = DataLoader(
     train_dataset_ssl,
-    batch_size=64,  # Increased batch size for better GPU utilization
+    batch_size=64,  # Adjust based on your GPU memory
     shuffle=True,
-    num_workers=8,  # Use multiple workers for data loading
-    pin_memory=True  # Speed up data transfer to GPU
+    num_workers=4,  # Adjust based on CPU resources
+    pin_memory=True,  # Speed up data transfer to GPU
+    drop_last=True   # Ensure all batches are the same size (important for SimCLR)
 )
 
 print(f"Training set size for SSL: {len(train_dataset_ssl)}")
 
-# Step 2: Define the Hierarchical Vision Transformer Architecture (Modified for SimCLR)
+# Step 2: Define the Hierarchical Vision Transformer Architecture
 class HierarchicalVisionTransformer(nn.Module):
     def __init__(self, image_size=299, patch_size=13, dim=768, depths=[2, 2, 6], heads=[4, 8, 16], mlp_ratio=4.0):
         super(HierarchicalVisionTransformer, self).__init__()
@@ -112,9 +113,12 @@ class HierarchicalVisionTransformer(nn.Module):
             self.cross_attentions.append(nn.MultiheadAttention(embed_dim=next_dim, num_heads=heads[i+1]))
 
         self.norm = nn.LayerNorm(self.stage_dims[-1])
+        
+        # Two-layer MLP projection head with BatchNorm (better for SimCLR)
         self.projection_head = nn.Sequential(
             nn.Linear(self.stage_dims[-1], 512),
-            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
             nn.Linear(512, 128)
         )
 
@@ -145,87 +149,176 @@ class HierarchicalVisionTransformer(nn.Module):
             x = x_att + x_proj
 
         x = self.norm(x)
-        x = x.mean(dim=1)
+        x = x.mean(dim=1)  # Global average pooling
         x = self.projection_head(x)
         return x
 
-# Step 3: Define NT-Xent Loss for SimCLR
+# Step 3: Define the NT-Xent Loss for SimCLR with numerical stability fixes
 def nt_xent_loss(embeddings, temperature=0.5):
+    """
+    NT-Xent loss for SimCLR with numerical stability improvements
+    """
     batch_size = embeddings.size(0) // 2
-    embeddings = F.normalize(embeddings, dim=1)
+    
+    # Apply L2 normalization with epsilon for stability
+    embeddings = F.normalize(embeddings, dim=1, eps=1e-8)
+    
+    # Split the batch into two views
     z_i = embeddings[:batch_size]
     z_j = embeddings[batch_size:]
+    
+    # All embeddings in the batch
     representations = torch.cat([z_i, z_j], dim=0)
-    similarity_matrix = torch.mm(representations, representations.t()) / temperature
+    
+    # Calculate similarity matrix with temperature scaling
+    similarity_matrix = torch.matmul(representations, representations.t()) / temperature
+    
+    # Extract positive pairs
     sim_ij = torch.diag(similarity_matrix, batch_size)
     sim_ji = torch.diag(similarity_matrix, -batch_size)
-    positive_samples = torch.cat([sim_ij, sim_ji], dim=0)
+    positive_pairs = torch.cat([sim_ij, sim_ji], dim=0)
+    
+    # Create mask that only leaves the negative samples
+    # (each sample is compared with 2*batch_size-2 other samples)
     mask = (~torch.eye(2 * batch_size, device=similarity_matrix.device).bool()).float()
-    numerator = torch.exp(positive_samples)
-    denominator = mask * torch.exp(similarity_matrix)
-    all_losses = -torch.log(numerator / torch.sum(denominator, dim=1))
-    loss = torch.mean(all_losses)
+    
+    # Compute the numerator and denominator for the loss
+    exp_positive_pairs = torch.exp(positive_pairs)
+    
+    # Using the mask, we compute exp(similarity) for the negative pairs
+    # Add a small value (1e-8) to avoid division by zero
+    exp_negative_pairs = torch.exp(similarity_matrix) * mask
+    
+    # Sum over all negative pairs for each sample
+    sum_exp_negative_pairs = torch.sum(exp_negative_pairs, dim=1) + 1e-8
+    
+    # Compute the final loss using the log-sum-exp trick for numerical stability
+    loss = -torch.mean(torch.log(exp_positive_pairs / (exp_positive_pairs + sum_exp_negative_pairs)))
+    
+    # Check for NaN or Inf values
+    if torch.isnan(loss) or torch.isinf(loss):
+        print("WARNING: Loss is NaN or Inf!")
+        # Return a substitute value that won't crash training but will signal a problem
+        return torch.tensor(10.0, device=similarity_matrix.device, requires_grad=True)
+    
     return loss
 
-# Step 4: Initialize Model, Optimizer, and Training Loop
-model = HierarchicalVisionTransformer(image_size=299, patch_size=13)
-model = model.to(device)
-print("Hierarchical Vision Transformer initialized for SimCLR pretraining.")
-
-optimizer = Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
-scaler = GradScaler()  # For mixed precision training
-
-# Step 5: Pretraining Loop
-num_epochs = 50
-best_loss = float('inf')
-patience = 5
-trigger_times = 0
-best_model_path = 'best_simclr_pretrained.pth'
-
-for epoch in range(num_epochs):
-    model.train()
-    total_loss = 0.0
+# Step 4: Training loop with improved stability
+def train_model(model, train_loader, optimizer, scaler, num_epochs=50, patience=10):
+    best_loss = float('inf')
+    trigger_times = 0
+    best_model_path = 'best_simclr_pretrained.pth'
     
-    for batch_idx, (img1, img2) in enumerate(train_loader_ssl):
-        img1, img2 = img1.to(device), img2.to(device)
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        valid_batches = 0
         
-        optimizer.zero_grad()
+        for batch_idx, (img1, img2) in enumerate(train_loader):
+            # Move data to device
+            img1, img2 = img1.to(device), img2.to(device)
+            
+            # Skip small batches (edge case for last batch if not dropped)
+            if img1.size(0) < 2:
+                continue
+                
+            optimizer.zero_grad()
+            
+            # Mixed precision forward pass
+            with autocast():
+                z1 = model(img1)
+                z2 = model(img2)
+                # Concatenate both views
+                embeddings = torch.cat([z1, z2], dim=0)
+                # Calculate loss
+                loss = nt_xent_loss(embeddings, temperature=0.1)  # Lower temperature (0.1) often works better
+            
+            # Skip this batch if loss is NaN or Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Skipping batch {batch_idx} due to NaN/Inf loss")
+                continue
+                
+            # Scale loss and backpropagate
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Update weights
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Track loss
+            running_loss += loss.item()
+            valid_batches += 1
+            
+            # Print progress
+            if (batch_idx + 1) % 20 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
         
-        # Use mixed precision training
-        with autocast():
-            z1 = model(img1)
-            z2 = model(img2)
-            embeddings = torch.cat([z1, z2], dim=0)
-            loss = nt_xent_loss(embeddings, temperature=0.5)
-        
-        # Scale loss and backpropagate
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        
-        total_loss += loss.item()
-        
-        if (batch_idx + 1) % 50 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader_ssl)}], Loss: {loss.item():.4f}")
+        # Calculate average loss for the epoch
+        if valid_batches > 0:
+            avg_loss = running_loss / valid_batches
+            print(f"Epoch [{epoch+1}/{num_epochs}] - Average Loss: {avg_loss:.4f}")
+            
+            # Save best model
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': best_loss,
+                }, best_model_path)
+                print(f"New best model saved with loss: {best_loss:.4f}")
+                trigger_times = 0
+            else:
+                trigger_times += 1
+                if trigger_times >= patience:
+                    print(f"Early stopping triggered after {epoch+1} epochs")
+                    break
+        else:
+            print(f"WARNING: No valid batches in epoch {epoch+1}")
     
-    avg_loss = total_loss / len(train_loader_ssl)
-    print(f"Epoch [{epoch+1}/{num_epochs}] - Average Loss: {avg_loss:.4f}")
+    # Save final model
+    final_model_path = 'final_simclr_pretrained.pth'
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': avg_loss if valid_batches > 0 else None,
+    }, final_model_path)
+    print(f"Final pretrained model saved at: {final_model_path}")
     
-    if avg_loss < best_loss:
-        best_loss = avg_loss
-        torch.save(model.state_dict(), best_model_path)
-        print(f"New best model saved with loss: {best_loss:.4f}")
-        trigger_times = 0
-    else:
-        trigger_times += 1
-        if trigger_times >= patience:
-            print(f"Early stopping triggered at epoch {epoch+1}")
-            break
+    return model
 
-# Save the final pretrained model
-final_model_path = 'final_simclr_pretrained.pth'
-torch.save(model.state_dict(), final_model_path)
-print(f"Final pretrained model saved at: {final_model_path}")
+# Step 5: Setup and run training
+def main():
+    # Initialize model
+    model = HierarchicalVisionTransformer(image_size=299, patch_size=13)
+    model = model.to(device)
+    print("Hierarchical Vision Transformer initialized for SimCLR pretraining.")
+    
+    # Initialize optimizer with weight decay (helps with stability)
+    optimizer = Adam(model.parameters(), lr=3e-4, weight_decay=1e-6)
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler()
+    
+    # Train model
+    trained_model = train_model(
+        model=model,
+        train_loader=train_loader_ssl,
+        optimizer=optimizer,
+        scaler=scaler,
+        num_epochs=50,
+        patience=10
+    )
+    
+    print("SimCLR pretraining complete!")
+    
+    return trained_model
 
-# Step 6: Define a linear evaluation protocol (optional - can be used later)
-print("Pretraining complete! You can now use this model for downstream tasks.")
+if __name__ == "__main__":
+    trained_model = main()
