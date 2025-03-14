@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import classification_report
-from torch.utils.data import Dataset  # Import Dataset base class
+from torchvision.models import Inception_V3_Weights
+import numpy as np
 
-# Define CustomDataset class (must match the one used in data_prep.py)
+# Define CustomDataset class
 class CustomDataset(Dataset):
     def __init__(self, data):
         self.data = data
@@ -27,7 +28,25 @@ combined_train_dataset = checkpoint['train_dataset']
 val_dataset = checkpoint['val_dataset']
 test_dataset = checkpoint['test_dataset']
 
-train_loader = DataLoader(combined_train_dataset, batch_size=32, shuffle=True)
+# Calculate class weights for imbalance
+def calculate_class_weights(dataset):
+    class_counts = np.zeros(7)  # 7 classes
+    for _, label in dataset.data:  # Access the label from each (image, label) tuple
+        class_counts[label] += 1
+    total_samples = np.sum(class_counts)
+    # Avoid division by zero for empty classes (though unlikely here)
+    class_counts[class_counts == 0] = 1  # Prevent division by zero
+    class_weights = total_samples / (len(class_counts) * class_counts)
+    return torch.FloatTensor(class_weights).to(device)
+
+train_class_weights = calculate_class_weights(combined_train_dataset)
+print("Class weights:", train_class_weights)
+
+# Create per-sample weights for WeightedRandomSampler
+sample_weights = [train_class_weights[label].item() for _, label in combined_train_dataset.data]
+sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(combined_train_dataset), replacement=True)
+
+train_loader = DataLoader(combined_train_dataset, batch_size=32, sampler=sampler)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
@@ -35,22 +54,25 @@ print(f"Training set size: {len(combined_train_dataset)}")
 print(f"Validation set size: {len(val_dataset)}")
 print(f"Test set size: {len(test_dataset)}")
 
-# Step 2: Load and Modify Inception V3
-model = models.inception_v3(pretrained=True)
+# Step 2: Load and Modify Inception V3 with Dropout
+model = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
 num_classes = 7
+model.dropout = nn.Dropout(p=0.5)  # Add dropout to reduce overfitting
 model.fc = nn.Linear(model.fc.in_features, num_classes)
 model = model.to(device)
-print("Inception V3 model loaded and modified for 7 classes.")
+print("Inception V3 model loaded and modified for 7 classes with dropout.")
 
 # Step 3: Define Loss Function, Optimizer, and Scheduler
-criterion = nn.CrossEntropyLoss()
-optimizer = Adam(model.parameters(), lr=0.001)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+criterion = nn.CrossEntropyLoss(weight=train_class_weights)  # Weighted loss for imbalance
+optimizer = Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)  # Lower lr and weight decay for regularization
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=6)
 
-# Step 4: Implement the Training Loop
-num_epochs = 20
+# Step 4: Implement the Training Loop with Early Stopping
+num_epochs = 30
 best_val_loss = float('inf')
 best_model_path = 'best_inception_v3.pth'
+patience = 5
+trigger_times = 0
 
 for epoch in range(num_epochs):
     model.train()
@@ -101,6 +123,12 @@ for epoch in range(num_epochs):
         best_val_loss = val_loss
         torch.save(model.state_dict(), best_model_path)
         print(f"Best model saved at epoch {epoch+1} with val_loss: {val_loss:.4f}")
+        trigger_times = 0
+    else:
+        trigger_times += 1
+        if trigger_times >= patience:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
 
     print(f"Epoch [{epoch+1}/{num_epochs}] - "
           f"Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
