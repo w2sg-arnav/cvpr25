@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.nn.parallel import DataParallel
 from torch.utils.checkpoint import checkpoint_sequential
 from torch.cuda.amp import GradScaler, autocast
@@ -14,6 +15,7 @@ import time
 import os
 import logging
 from torchvision import transforms
+from torchvision.transforms import RandAugment
 from PIL import Image
 import torchvision.transforms.functional as TF
 from typing import Tuple, Optional, Any
@@ -27,31 +29,46 @@ np.random.seed(42)
 # Set environment variable for memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Enable optimizations for H100
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Focal Loss
+# Focal Loss with Label Smoothing
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+    def __init__(self, gamma=2.5, alpha=None, label_smoothing=0.1, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
+        self.label_smoothing = label_smoothing
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
+        num_classes = inputs.size(1)
+        smoothed_targets = torch.full_like(inputs, self.label_smoothing / (num_classes - 1))
+        smoothed_targets.scatter_(1, targets.unsqueeze(1), 1 - self.label_smoothing)
+        
+        logpt = F.log_softmax(inputs, dim=1)
+        ce_loss = -logpt * smoothed_targets
+        ce_loss = ce_loss.sum(dim=1)
+        
+        pt = torch.exp(logpt.gather(1, targets.unsqueeze(1)).squeeze(1))
         focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
         if self.alpha is not None:
             focal_loss = self.alpha[targets] * focal_loss
+        
         if self.reduction == 'mean':
             return focal_loss.mean()
         return focal_loss.sum()
 
 # Hierarchical Vision Transformer (HVT) Components
 class MultiScalePatchEmbed(nn.Module):
-    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[768, 384, 192]):
+    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[1024, 512, 264]):
         super().__init__()
         self.patch_sizes = patch_sizes
         self.embed_dims = embed_dims
@@ -78,7 +95,7 @@ class MultiScalePatchEmbed(nn.Module):
         return tuple(features)
 
 class CrossAttentionFusion(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 16):
+    def __init__(self, dim: int, num_heads: int = 24):
         super().__init__()
         self.num_heads = num_heads
         self.scale = dim ** -0.5
@@ -101,16 +118,59 @@ class CrossAttentionFusion(nn.Module):
         out = (attn @ v).permute(0, 2, 1, 3).reshape(B, N, C)
         return self.out(out)
 
+class TransformerEncoderLayerWithResidual(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.3, drop_path_rate=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
+
+    def forward(self, src):
+        src2 = self.self_attn(src, src, src)[0]
+        src = src + self.drop_path(self.dropout1(src2))  # Residual connection
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
+        src = src + self.drop_path(self.dropout2(src2))  # Residual connection
+        src = self.norm2(src)
+        return src
+
+# DropPath (Stochastic Depth)
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # Binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
 class HierarchicalVisionTransformer(nn.Module):
-    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [768, 384, 192], num_heads: int = 16, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):
+    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [1024, 512, 264], num_heads: int = 24, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):
         super().__init__()
         self.has_multimodal = has_multimodal
         self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, embed_dims=embed_dims)
-        self.embed_dim_total = sum(embed_dims)
+        self.embed_dim_total = sum(embed_dims)  # 1800, divisible by 24
         
         self.transformer_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=self.embed_dim_total, nhead=num_heads, dim_feedforward=self.embed_dim_total*4, dropout=0.2, batch_first=True)
-            for _ in range(num_layers)
+            TransformerEncoderLayerWithResidual(
+                d_model=self.embed_dim_total, 
+                nhead=num_heads, 
+                dim_feedforward=self.embed_dim_total*4, 
+                dropout=0.3,  # Increased dropout
+                drop_path_rate=0.1  # Stochastic depth
+            ) for _ in range(num_layers)
         ])
         
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim_total))
@@ -162,6 +222,64 @@ class HierarchicalVisionTransformer(nn.Module):
         cls_output = self.norm(cls_output)
         return self.head(cls_output)
 
+# MixUp Implementation
+def mixup(data, targets, alpha=0.2):
+    indices = torch.randperm(data.size(0), device=data.device)
+    shuffled_data = data[indices]
+    shuffled_targets = targets[indices]
+    
+    lam = np.random.beta(alpha, alpha)
+    mixed_data = lam * data + (1 - lam) * shuffled_data
+    return mixed_data, targets, shuffled_targets, lam
+
+# Test-Time Augmentation (TTA)
+def tta_inference(model, image, spectral=None, num_augments=5, device='cuda'):
+    model.eval()
+    predictions = []
+    
+    augmentations = [
+        transforms.RandomHorizontalFlip(p=1.0),
+        transforms.RandomVerticalFlip(p=1.0),
+        transforms.RandomRotation(degrees=(90, 90)),
+        transforms.RandomRotation(degrees=(180, 180)),
+        transforms.RandomRotation(degrees=(270, 270)),
+    ]
+    
+    with torch.no_grad():
+        # Original prediction
+        pred = model(image, spectral)
+        predictions.append(F.softmax(pred, dim=1))
+        
+        # Augmented predictions
+        for i in range(min(num_augments, len(augmentations))):
+            aug_image = augmentations[i](image)
+            aug_pred = model(aug_image, spectral)
+            predictions.append(F.softmax(aug_pred, dim=1))
+    
+    # Average predictions
+    avg_pred = torch.stack(predictions).mean(0)
+    return avg_pred
+
+# Gradient Centralization for AdamW
+class AdamWGC(optim.AdamW):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+        super().__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('AdamWGC does not support sparse gradients')
+                
+                # Gradient Centralization
+                if len(grad.shape) > 1:
+                    grad.add_(-grad.mean(dim=tuple(range(1, len(grad.shape))), keepdim=True))
+        
+        super().step(closure)
+
 # Step 1: Load Preprocessed Data
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
@@ -192,27 +310,32 @@ if len(class_names) > 7:
     class_names = class_names[:7]
 num_classes = len(class_names)
 
-# Define data augmentation transform with more aggressive augmentation
-# Transform for training (convert tensor to PIL, apply augmentations, convert back)
-train_transform = transforms.Compose([
+# Define data augmentation transform with RandAugment (optimized for tensor input)
+# Split the transform into two parts: augmentation (needs uint8) and normalization (needs float32)
+train_augmentation = transforms.Compose([
+    transforms.Lambda(lambda x: (x * 255).clamp(0, 255).to(torch.uint8) if isinstance(x, torch.Tensor) else x),  # Ensure uint8 for augmentation
+    transforms.RandomResizedCrop(size=299, scale=(0.7, 1.0), interpolation=transforms.InterpolationMode.BILINEAR),
+    RandAugment(num_ops=2, magnitude=9),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(30),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=10),
-    transforms.RandomResizedCrop(size=299, scale=(0.7, 1.0)),
-    transforms.ToTensor(),
+    transforms.Lambda(lambda x: (x.float() / 255) if isinstance(x, torch.Tensor) else x),  # Convert back to float32 [0, 1]
+])
+
+train_normalization = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# Transform for validation/test (keep as tensor, no augmentation)
-val_test_transform = transforms.Compose([])  # No transformation since data is already a tensor
+val_test_transform = transforms.Compose([
+    transforms.ToTensor(),  # Convert to float32 [0, 1] if not already
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
-# Wrap datasets with appropriate transforms
+# Optimized AugmentedDataset to handle tensor inputs efficiently
 class AugmentedDataset(Dataset):
-    def __init__(self, dataset, transform=None, is_train=False):
+    def __init__(self, dataset, augmentation=None, normalization=None, is_train=False):
         self.dataset = dataset
-        self.transform = transform
+        self.augmentation = augmentation
+        self.normalization = normalization
         self.is_train = is_train
 
     def __len__(self):
@@ -220,22 +343,45 @@ class AugmentedDataset(Dataset):
 
     def __getitem__(self, idx):
         rgb, spectral, label = self.dataset[idx]
-        if self.transform:
-            # Apply PIL conversion and augmentation only for training dataset
-            if self.is_train and isinstance(rgb, torch.Tensor):
-                # Denormalize (assuming the tensor is normalized)
-                rgb = rgb * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                # Convert to PIL Image
-                rgb = rgb.permute(1, 2, 0).numpy()
-                rgb = (rgb * 255).astype(np.uint8)
-                rgb = Image.fromarray(rgb)
-            # Apply transform (for training, this includes ToTensor(); for val/test, it's empty)
-            rgb = self.transform(rgb)
+
+        if isinstance(rgb, torch.Tensor):
+            # Handle tensor input (preprocessed data likely float32)
+            if self.is_train and self.augmentation:
+                rgb = self.augmentation(rgb)  # Applies uint8 conversion internally
+            elif self.normalization:
+                if rgb.dtype == torch.uint8:
+                    rgb = rgb.float() / 255  # Convert to float32 [0, 1]
+                rgb = self.normalization(rgb)
+        else:
+            # Handle non-tensor input (e.g., NumPy array or PIL Image)
+            if isinstance(rgb, np.ndarray):
+                rgb = Image.fromarray((rgb * 255).astype(np.uint8) if rgb.max() <= 1.0 else rgb.astype(np.uint8))
+            if self.is_train and self.augmentation:
+                rgb = self.augmentation(rgb)
+            if self.normalization:
+                rgb = self.normalization(rgb)
+
         return rgb, spectral, label
 
-augmented_train_dataset = AugmentedDataset(train_dataset, transform=train_transform, is_train=True)
-val_dataset = AugmentedDataset(val_dataset, transform=val_test_transform, is_train=False)
-test_dataset = AugmentedDataset(test_dataset, transform=val_test_transform, is_train=False)
+# Apply the transforms correctly
+augmented_train_dataset = AugmentedDataset(
+    train_dataset,
+    augmentation=train_augmentation,
+    normalization=train_normalization,
+    is_train=True
+)
+val_dataset = AugmentedDataset(
+    val_dataset,
+    augmentation=None,
+    normalization=val_test_transform,
+    is_train=False
+)
+test_dataset = AugmentedDataset(
+    test_dataset,
+    augmentation=None,
+    normalization=val_test_transform,
+    is_train=False
+)
 
 # Compute class weights and sampler for oversampling
 train_labels = []
@@ -251,53 +397,61 @@ logger.info(f"Class weights: {class_weights}")
 sample_weights = [class_weights[label].item() for label in train_labels]
 sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
-batch_size = 16
-effective_batch_size = 32
+# Optimize batch size for H100
+batch_size = 32
+effective_batch_size = 64
 accumulation_steps = effective_batch_size // batch_size
-train_loader = DataLoader(augmented_train_dataset, batch_size=batch_size, sampler=sampler, num_workers=8, pin_memory=True, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+train_loader = DataLoader(augmented_train_dataset, batch_size=batch_size, sampler=sampler, num_workers=16, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=True)
 
 logger.info(f"Training set size: {len(augmented_train_dataset)}")
 logger.info(f"Validation set size: {len(val_dataset)}")
 logger.info(f"Test set size: {len(test_dataset)}")
 
-# Step 2: Initialize HVT Model with Pretrained Weights
+# Step 2: Initialize HVT Model (Training from Scratch due to Pretrained Mismatch)
 model = HierarchicalVisionTransformer(
     num_classes=num_classes,
     img_size=299,
     patch_sizes=[16, 8, 4],
-    embed_dims=[768, 384, 192],
-    num_heads=16,
+    embed_dims=[1024, 512, 264],
+    num_heads=24,
     num_layers=16,
     has_multimodal=has_multimodal,
     spectral_dim=299
 )
 
-# Load pretrained encoder from Phase 4
-pretrained_path = os.path.join('phase4_ssl_results', 'pretrained_hvt.pth')
-if os.path.exists(pretrained_path):
-    pretrained_checkpoint = torch.load(pretrained_path)
-    model.load_state_dict(pretrained_checkpoint['encoder_state_dict'], strict=False)
-    logger.info("Loaded pretrained encoder from Phase 4.")
-else:
-    logger.warning("Pretrained encoder not found. Training from scratch.")
+logger.info("Training model from scratch due to pretrained checkpoint mismatch.")
+
+# Compile the model for faster training (PyTorch 2.x feature)
+if torch.__version__.startswith('2'):
+    model = torch.compile(model)
+    logger.info("Model compiled with torch.compile for faster training.")
 
 if num_gpus > 1:
     model = DataParallel(model)
 model = model.to(device)
 logger.info(f"HVT model initialized with {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters.")
 
-# Step 3: Define Loss, Optimizer, and Scheduler with Differential Learning Rates
-criterion = FocalLoss(gamma=2.0, alpha=class_weights)
-optimizer = optim.AdamW([
-    {'params': [p for n, p in model.named_parameters() if 'head' not in n], 'lr': 1e-5},
-    {'params': [p for n, p in model.named_parameters() if 'head' in n], 'lr': 1e-4}
-], weight_decay=5e-3)
-scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+# Step 3: Define Loss, Optimizer, and Scheduler with Layer-Specific Learning Rates
+criterion = FocalLoss(gamma=2.5, alpha=class_weights, label_smoothing=0.1)
+optimizer = AdamWGC([
+    {'params': [p for n, p in model.named_parameters() if 'patch_embed' in n], 'lr': 1e-5},
+    {'params': [p for n, p in model.named_parameters() if 'transformer_layers.0' in n or 'transformer_layers.1' in n], 'lr': 3e-5},
+    {'params': [p for n, p in model.named_parameters() if 'transformer_layers' in n and not any(f'transformer_layers.{i}' in n for i in [0,1])], 'lr': 5e-5},
+    {'params': [p for n, p in model.named_parameters() if 'head' in n], 'lr': 5e-4}
+], weight_decay=2e-3)
+
+scheduler = OneCycleLR(
+    optimizer,
+    max_lr=[1e-5, 3e-5, 5e-5, 5e-4],
+    steps_per_epoch=len(train_loader) // accumulation_steps,
+    epochs=100,
+    pct_start=0.1
+)
 scaler = GradScaler()
 
-# Step 4: Training Loop with Gradient Accumulation, Checkpointing, and Mixed Precision
+# Step 4: Training Loop with MixUp and Optimizations
 num_epochs = 100
 best_val_acc = 0.0
 best_model_path = os.path.join(output_dir, 'best_hvt.pth')
@@ -323,8 +477,14 @@ for epoch in range(num_epochs):
             optimizer.zero_grad(set_to_none=True)
 
         with autocast():
-            outputs = model(rgb, spectral)
-            loss = criterion(outputs, labels) / accumulation_steps
+            if np.random.rand() < 0.5:  # Apply MixUp 50% of the time
+                mixed_rgb, targets_a, targets_b, lam = mixup(rgb, labels)
+                outputs = model(mixed_rgb, spectral)
+                loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+            else:
+                outputs = model(rgb, spectral)
+                loss = criterion(outputs, labels)
+            loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -416,7 +576,7 @@ plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'training_history.png'))
 plt.close()
 
-# Test Evaluation
+# Test Evaluation with TTA
 logger.info("Loading best model for evaluation on test set...")
 checkpoint = torch.load(best_model_path)
 if num_gpus > 1:
@@ -439,7 +599,7 @@ with torch.no_grad():
             spectral = None
             
         with autocast():
-            outputs = model(rgb, spectral)
+            outputs = tta_inference(model, rgb, spectral, num_augments=5, device=device)
             loss = criterion(outputs, labels)
             
         test_loss += loss.item()
