@@ -1,9 +1,8 @@
-# train_hierarchical_vit.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn.parallel import DataParallel
 from torch.utils.checkpoint import checkpoint_sequential
 from torch.cuda.amp import GradScaler, autocast
@@ -15,8 +14,15 @@ import time
 import os
 import logging
 from torchvision import transforms
+from PIL import Image
+import torchvision.transforms.functional as TF
 from typing import Tuple, Optional, Any
 from dataset_utils import CottonLeafDataset
+
+# Set random seed for reproducibility
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+np.random.seed(42)
 
 # Set environment variable for memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -45,7 +51,7 @@ class FocalLoss(nn.Module):
 
 # Hierarchical Vision Transformer (HVT) Components
 class MultiScalePatchEmbed(nn.Module):
-    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[1024, 512, 256]):  # Increased embed_dims
+    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[768, 384, 192]):
         super().__init__()
         self.patch_sizes = patch_sizes
         self.embed_dims = embed_dims
@@ -96,14 +102,14 @@ class CrossAttentionFusion(nn.Module):
         return self.out(out)
 
 class HierarchicalVisionTransformer(nn.Module):
-    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [1024, 512, 256], num_heads: int = 16, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):  # Increased num_layers
+    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [768, 384, 192], num_heads: int = 16, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):
         super().__init__()
         self.has_multimodal = has_multimodal
         self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, embed_dims=embed_dims)
         self.embed_dim_total = sum(embed_dims)
         
         self.transformer_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=self.embed_dim_total, nhead=num_heads, dim_feedforward=self.embed_dim_total*4, dropout=0.1, batch_first=True)
+            nn.TransformerEncoderLayer(d_model=self.embed_dim_total, nhead=num_heads, dim_feedforward=self.embed_dim_total*4, dropout=0.2, batch_first=True)
             for _ in range(num_layers)
         ])
         
@@ -166,7 +172,7 @@ if num_gpus > 1:
 else:
     logger.info("Using 1 H100 GPU.")
 
-output_dir = 'phase3_hvt_results_improved'
+output_dir = 'phase5_hvt_results_optimized'
 os.makedirs(output_dir, exist_ok=True)
 
 try:
@@ -187,36 +193,68 @@ if len(class_names) > 7:
 num_classes = len(class_names)
 
 # Define data augmentation transform with more aggressive augmentation
+# Transform for training (convert tensor to PIL, apply augmentations, convert back)
 train_transform = transforms.Compose([
     transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),  # Reintroduced
-    transforms.RandomRotation(10),    # Increased to 10 degrees
-    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(30),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=10),
+    transforms.RandomResizedCrop(size=299, scale=(0.7, 1.0)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# Wrap training dataset with augmentation
+# Transform for validation/test (keep as tensor, no augmentation)
+val_test_transform = transforms.Compose([])  # No transformation since data is already a tensor
+
+# Wrap datasets with appropriate transforms
 class AugmentedDataset(Dataset):
-    def __init__(self, dataset, transform=None):
+    def __init__(self, dataset, transform=None, is_train=False):
         self.dataset = dataset
         self.transform = transform
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         rgb, spectral, label = self.dataset[idx]
-        if self.transform and rgb is not None:
+        if self.transform:
+            # Apply PIL conversion and augmentation only for training dataset
+            if self.is_train and isinstance(rgb, torch.Tensor):
+                # Denormalize (assuming the tensor is normalized)
+                rgb = rgb * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                # Convert to PIL Image
+                rgb = rgb.permute(1, 2, 0).numpy()
+                rgb = (rgb * 255).astype(np.uint8)
+                rgb = Image.fromarray(rgb)
+            # Apply transform (for training, this includes ToTensor(); for val/test, it's empty)
             rgb = self.transform(rgb)
         return rgb, spectral, label
 
-augmented_train_dataset = AugmentedDataset(train_dataset, transform=train_transform)
-val_dataset = AugmentedDataset(val_dataset, transform=None)
-test_dataset = AugmentedDataset(test_dataset, transform=None)
+augmented_train_dataset = AugmentedDataset(train_dataset, transform=train_transform, is_train=True)
+val_dataset = AugmentedDataset(val_dataset, transform=val_test_transform, is_train=False)
+test_dataset = AugmentedDataset(test_dataset, transform=val_test_transform, is_train=False)
+
+# Compute class weights and sampler for oversampling
+train_labels = []
+for _, _, label in augmented_train_dataset:
+    train_labels.append(label)
+train_labels = torch.tensor(train_labels, device=device)
+class_counts = [torch.sum(train_labels == i).item() for i in range(num_classes)]
+class_weights = torch.tensor([1.0 / count if count > 0 else 1.0 for count in class_counts], device=device)
+class_weights = class_weights / class_weights.sum() * num_classes
+logger.info(f"Class weights: {class_weights}")
+
+# Oversample underrepresented classes
+sample_weights = [class_weights[label].item() for label in train_labels]
+sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
 batch_size = 16
 effective_batch_size = 32
 accumulation_steps = effective_batch_size // batch_size
-train_loader = DataLoader(augmented_train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
+train_loader = DataLoader(augmented_train_dataset, batch_size=batch_size, sampler=sampler, num_workers=8, pin_memory=True, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
@@ -224,43 +262,46 @@ logger.info(f"Training set size: {len(augmented_train_dataset)}")
 logger.info(f"Validation set size: {len(val_dataset)}")
 logger.info(f"Test set size: {len(test_dataset)}")
 
-# Collect labels by iterating over the dataset
-labels = []
-for _, _, label in augmented_train_dataset:
-    labels.append(label)
-labels = torch.tensor(labels, device=device)
-class_counts = [torch.sum(labels == i).item() for i in range(num_classes)]
-class_weights = torch.tensor([1.0 / count if count > 0 else 1.0 for count in class_counts], device=device)
-class_weights = class_weights / class_weights.sum() * num_classes
-logger.info(f"Class weights: {class_weights}")
-
-# Step 2: Initialize HVT Model
+# Step 2: Initialize HVT Model with Pretrained Weights
 model = HierarchicalVisionTransformer(
     num_classes=num_classes,
     img_size=299,
     patch_sizes=[16, 8, 4],
-    embed_dims=[1024, 512, 256],
+    embed_dims=[768, 384, 192],
     num_heads=16,
     num_layers=16,
     has_multimodal=has_multimodal,
     spectral_dim=299
 )
+
+# Load pretrained encoder from Phase 4
+pretrained_path = os.path.join('phase4_ssl_results', 'pretrained_hvt.pth')
+if os.path.exists(pretrained_path):
+    pretrained_checkpoint = torch.load(pretrained_path)
+    model.load_state_dict(pretrained_checkpoint['encoder_state_dict'], strict=False)
+    logger.info("Loaded pretrained encoder from Phase 4.")
+else:
+    logger.warning("Pretrained encoder not found. Training from scratch.")
+
 if num_gpus > 1:
     model = DataParallel(model)
 model = model.to(device)
 logger.info(f"HVT model initialized with {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters.")
 
-# Step 3: Define Loss, Optimizer, and Scheduler
+# Step 3: Define Loss, Optimizer, and Scheduler with Differential Learning Rates
 criterion = FocalLoss(gamma=2.0, alpha=class_weights)
-optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-3)  # Lowered learning rate, increased weight decay
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)  # Added ReduceLROnPlateau
+optimizer = optim.AdamW([
+    {'params': [p for n, p in model.named_parameters() if 'head' not in n], 'lr': 1e-5},
+    {'params': [p for n, p in model.named_parameters() if 'head' in n], 'lr': 1e-4}
+], weight_decay=5e-3)
+scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
 scaler = GradScaler()
 
 # Step 4: Training Loop with Gradient Accumulation, Checkpointing, and Mixed Precision
-num_epochs = 80
+num_epochs = 100
 best_val_acc = 0.0
 best_model_path = os.path.join(output_dir, 'best_hvt.pth')
-patience = 10
+patience = 15
 trigger_times = 0
 history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
@@ -329,7 +370,7 @@ for epoch in range(num_epochs):
     history['val_loss'].append(val_loss)
     history['val_acc'].append(val_accuracy)
 
-    scheduler.step(val_loss)
+    scheduler.step()
     
     logger.info(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
                 f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
@@ -354,6 +395,7 @@ for epoch in range(num_epochs):
 training_time = time.time() - start_time
 logger.info(f"Training completed in {training_time/60:.2f} minutes")
 
+# Plot training history
 plt.figure(figsize=(12, 5))
 plt.subplot(1, 2, 1)
 plt.plot(history['train_loss'], label='Train Loss')
@@ -374,6 +416,7 @@ plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'training_history.png'))
 plt.close()
 
+# Test Evaluation
 logger.info("Loading best model for evaluation on test set...")
 checkpoint = torch.load(best_model_path)
 if num_gpus > 1:
@@ -411,6 +454,7 @@ test_loss /= len(test_loader)
 test_accuracy = 100 * test_correct / test_total
 logger.info(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%")
 
+# Per-class accuracy and classification report
 logger.info("\nPer-class accuracy:")
 class_correct = [0] * num_classes
 class_total = [0] * num_classes
@@ -429,6 +473,7 @@ logger.info("\nClassification Report:")
 report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
 print(classification_report(all_labels, all_preds, target_names=class_names))
 
+# Confusion Matrix
 cm = confusion_matrix(all_labels, all_preds)
 plt.figure(figsize=(10, 8))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
@@ -440,6 +485,7 @@ plt.tight_layout()
 plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
 plt.close()
 
+# Save results summary
 with open(os.path.join(output_dir, 'results_summary.txt'), 'w') as f:
     f.write(f"HVT Results\n\n")
     f.write(f"Training time: {training_time/60:.2f} minutes\n")
@@ -467,5 +513,5 @@ torch.save({
     'training_history': history
 }, os.path.join(output_dir, 'hvt_model.pth'))
 
-logger.info(f"Phase 3 complete! HVT model trained and evaluated with test accuracy: {test_accuracy:.2f}%")
+logger.info(f"Phase 5 complete! HVT model trained and evaluated with test accuracy: {test_accuracy:.2f}%")
 logger.info(f"Results saved to {output_dir}/")
