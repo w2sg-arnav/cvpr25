@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.parallel import DataParallel
 from torch.utils.checkpoint import checkpoint_sequential
 from torch.cuda.amp import GradScaler, autocast
@@ -16,7 +16,7 @@ import os
 import logging
 from torchvision import transforms
 from typing import Tuple, Optional, Any
-from dataset_utils import CottonLeafDataset  # Import the existing dataset class
+from dataset_utils import CottonLeafDataset
 
 # Set environment variable for memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -25,48 +25,33 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Focal Loss with Label Smoothing
-class FocalLossWithLabelSmoothing(nn.Module):
-    def __init__(self, gamma=2.5, alpha=None, smoothing=0.1, reduction='mean'):
+# Focal Loss
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.smoothing = smoothing
         self.reduction = reduction
-        self.num_classes = None
 
     def forward(self, inputs, targets):
-        if self.num_classes is None:
-            self.num_classes = inputs.size(1)
-        
-        # Label smoothing
-        log_probs = nn.functional.log_softmax(inputs, dim=1)
-        targets_one_hot = torch.zeros_like(inputs).scatter_(1, targets.unsqueeze(1), 1)
-        targets_smoothed = targets_one_hot * (1 - self.smoothing) + self.smoothing / self.num_classes
-        
-        # Focal loss
-        ce_loss = -targets_smoothed * log_probs
-        ce_loss = ce_loss.sum(dim=1)
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
         focal_loss = (1 - pt) ** self.gamma * ce_loss
-        
         if self.alpha is not None:
             focal_loss = self.alpha[targets] * focal_loss
-        
         if self.reduction == 'mean':
             return focal_loss.mean()
         return focal_loss.sum()
 
 # Hierarchical Vision Transformer (HVT) Components
 class MultiScalePatchEmbed(nn.Module):
-    """Multi-scale patch embedding layer for hierarchical processing with alignment."""
-    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[512, 256, 128]):
+    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[1024, 512, 256]):  # Increased embed_dims
         super().__init__()
         self.patch_sizes = patch_sizes
         self.embed_dims = embed_dims
         self.layers = nn.ModuleList()
         
-        base_target_size = img_size // patch_sizes[0]  # 299 // 16 = 18
+        base_target_size = img_size // patch_sizes[0]
         
         for patch_size, embed_dim in zip(patch_sizes, embed_dims):
             layer = nn.Sequential(
@@ -87,7 +72,6 @@ class MultiScalePatchEmbed(nn.Module):
         return tuple(features)
 
 class CrossAttentionFusion(nn.Module):
-    """Cross-attention mechanism for multimodal fusion (RGB + spectral)."""
     def __init__(self, dim: int, num_heads: int = 16):
         super().__init__()
         self.num_heads = num_heads
@@ -112,15 +96,14 @@ class CrossAttentionFusion(nn.Module):
         return self.out(out)
 
 class HierarchicalVisionTransformer(nn.Module):
-    """Reduced HVT for memory efficiency on H100."""
-    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [512, 256, 128], num_heads: int = 16, num_layers: int = 8, has_multimodal: bool = False, spectral_dim: int = 299):
+    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [1024, 512, 256], num_heads: int = 16, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):  # Increased num_layers
         super().__init__()
         self.has_multimodal = has_multimodal
         self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, embed_dims=embed_dims)
         self.embed_dim_total = sum(embed_dims)
         
         self.transformer_layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=self.embed_dim_total, nhead=num_heads, dim_feedforward=self.embed_dim_total*4, dropout=0.2, batch_first=True)  # Increased dropout to 0.2
+            nn.TransformerEncoderLayer(d_model=self.embed_dim_total, nhead=num_heads, dim_feedforward=self.embed_dim_total*4, dropout=0.1, batch_first=True)
             for _ in range(num_layers)
         ])
         
@@ -173,27 +156,6 @@ class HierarchicalVisionTransformer(nn.Module):
         cls_output = self.norm(cls_output)
         return self.head(cls_output)
 
-# Custom LR Scheduler with Warmup
-class WarmupCosineAnnealingLR:
-    def __init__(self, optimizer, warmup_epochs, total_epochs, eta_min=0):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.eta_min = eta_min
-        self.cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs - warmup_epochs, eta_min=eta_min)
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-
-    def step(self, epoch):
-        if epoch < self.warmup_epochs:
-            # Linear warmup
-            for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-                param_group['lr'] = base_lr * (epoch + 1) / self.warmup_epochs
-        else:
-            self.cosine_scheduler.step(epoch - self.warmup_epochs)
-
-    def get_lr(self):
-        return [group['lr'] for group in self.optimizer.param_groups]
-
 # Step 1: Load Preprocessed Data
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
@@ -224,15 +186,15 @@ if len(class_names) > 7:
     class_names = class_names[:7]
 num_classes = len(class_names)
 
-# Define data augmentation transform with enhanced diversity
+# Define data augmentation transform with more aggressive augmentation
 train_transform = transforms.Compose([
     transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),  # Added vertical flip
-    transforms.RandomRotation(5),
+    transforms.RandomVerticalFlip(),  # Reintroduced
+    transforms.RandomRotation(10),    # Increased to 10 degrees
     transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
 ])
 
-# Wrap training dataset with augmentation (assuming CottonLeafDataset supports transform)
+# Wrap training dataset with augmentation
 class AugmentedDataset(Dataset):
     def __init__(self, dataset, transform=None):
         self.dataset = dataset
@@ -248,10 +210,10 @@ class AugmentedDataset(Dataset):
         return rgb, spectral, label
 
 augmented_train_dataset = AugmentedDataset(train_dataset, transform=train_transform)
-val_dataset = AugmentedDataset(val_dataset, transform=None)  # No augmentation for validation
-test_dataset = AugmentedDataset(test_dataset, transform=None)  # No augmentation for test
+val_dataset = AugmentedDataset(val_dataset, transform=None)
+test_dataset = AugmentedDataset(test_dataset, transform=None)
 
-batch_size = 8
+batch_size = 16
 effective_batch_size = 32
 accumulation_steps = effective_batch_size // batch_size
 train_loader = DataLoader(augmented_train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
@@ -277,9 +239,9 @@ model = HierarchicalVisionTransformer(
     num_classes=num_classes,
     img_size=299,
     patch_sizes=[16, 8, 4],
-    embed_dims=[512, 256, 128],
+    embed_dims=[1024, 512, 256],
     num_heads=16,
-    num_layers=8,
+    num_layers=16,
     has_multimodal=has_multimodal,
     spectral_dim=299
 )
@@ -289,13 +251,13 @@ model = model.to(device)
 logger.info(f"HVT model initialized with {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters.")
 
 # Step 3: Define Loss, Optimizer, and Scheduler
-criterion = FocalLossWithLabelSmoothing(gamma=2.5, alpha=class_weights, smoothing=0.1)  # Added label smoothing
-optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=5e-4)  # Reduced learning rate
-scheduler = WarmupCosineAnnealingLR(optimizer, warmup_epochs=5, total_epochs=80, eta_min=1e-6)  # Warmup + CosineAnnealingLR
+criterion = FocalLoss(gamma=2.0, alpha=class_weights)
+optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-3)  # Lowered learning rate, increased weight decay
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)  # Added ReduceLROnPlateau
 scaler = GradScaler()
 
 # Step 4: Training Loop with Gradient Accumulation, Checkpointing, and Mixed Precision
-num_epochs = 80  # Increased to 80
+num_epochs = 80
 best_val_acc = 0.0
 best_model_path = os.path.join(output_dir, 'best_hvt.pth')
 patience = 10
@@ -367,7 +329,7 @@ for epoch in range(num_epochs):
     history['val_loss'].append(val_loss)
     history['val_acc'].append(val_accuracy)
 
-    scheduler.step(epoch)
+    scheduler.step(val_loss)
     
     logger.info(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
                 f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
@@ -507,6 +469,3 @@ torch.save({
 
 logger.info(f"Phase 3 complete! HVT model trained and evaluated with test accuracy: {test_accuracy:.2f}%")
 logger.info(f"Results saved to {output_dir}/")
-
-# Note: For ensemble modeling, consider training multiple models with different seeds or hyperparameters
-# and averaging predictions in a future phase.
