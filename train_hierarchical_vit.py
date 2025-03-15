@@ -1,467 +1,347 @@
+# train_hvt.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-from torch.utils.data import DataLoader, Dataset
-from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.metrics import classification_report
-import os
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
 import matplotlib.pyplot as plt
-from torchvision import transforms
+import seaborn as sns
+import time
+import os
+from torchvision.models import ViT_B_16_Weights
 from torch.cuda.amp import GradScaler, autocast
+import logging
+from dataset_utils import CottonLeafDataset
+from typing import Tuple, Optional
 
-# Assuming Step 1 (data loading) is already defined and working
-# Variables like train_loader, val_loader, test_loader, device, has_multimodal, etc., are set up
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Step 2: Improved Hierarchical Vision Transformer with Multimodal Support
-class MultiModalFusion(nn.Module):
-    def __init__(self, rgb_dim, spectral_dim, fusion_dim, num_heads=8):
-        super(MultiModalFusion, self).__init__()
-        self.rgb_proj = nn.Linear(rgb_dim, fusion_dim)
-        self.spectral_proj = nn.Linear(spectral_dim, fusion_dim)
-        self.cross_attention = nn.MultiheadAttention(embed_dim=fusion_dim, num_heads=num_heads)
-        self.norm1 = nn.LayerNorm(fusion_dim)
-        self.norm2 = nn.LayerNorm(fusion_dim)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim * 4),
-            nn.GELU(),
-            nn.Linear(fusion_dim * 4, fusion_dim)
-        )
+# Hierarchical Vision Transformer (HVT) Components
+class MultiScalePatchEmbed(nn.Module):
+    """Multi-scale patch embedding layer for hierarchical processing."""
+    def __init__(self, img_size=299, patch_sizes=[16, 8], in_channels=3, embed_dims=[768, 384]):
+        super().__init__()
+        self.patch_sizes = patch_sizes
+        self.embed_dims = embed_dims
+        self.layers = nn.ModuleList()
         
-    def forward(self, rgb_features, spectral_features):
-        rgb_proj = self.rgb_proj(rgb_features)
-        spectral_proj = self.spectral_proj(spectral_features)
-        attended_features, _ = self.cross_attention(query=rgb_proj, key=spectral_proj, value=spectral_proj)
-        if torch.any(torch.isnan(attended_features)) or torch.any(torch.isinf(attended_features)):
-            print("NaN/Inf in cross_attention output")
-            attended_features = torch.nan_to_num(attended_features, nan=0.0)
-        x = self.norm1(rgb_proj + attended_features)
-        ff_output = self.feed_forward(x)
-        if torch.any(torch.isnan(ff_output)) or torch.any(torch.isinf(ff_output)):
-            print("NaN/Inf in feed_forward output")
-            ff_output = torch.nan_to_num(ff_output, nan=0.0)
-        fused_features = self.norm2(x + ff_output)
-        return fused_features
+        for patch_size, embed_dim in zip(patch_sizes, embed_dims):
+            self.layers.append(nn.Sequential(
+                nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size),
+                nn.BatchNorm2d(embed_dim),
+                nn.ReLU(inplace=True)
+            ))
+        self.pos_embed = nn.Parameter(torch.zeros(1, sum(embed_dims), img_size // min(patch_sizes), img_size // min(patch_sizes)))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        features = []
+        for layer in self.layers:
+            features.append(layer(x))
+        return tuple(features)
+
+class CrossAttentionFusion(nn.Module):
+    """Cross-attention mechanism for multimodal fusion (RGB + spectral)."""
+    def __init__(self, dim: int, num_heads: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = dim ** -0.5
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(self, rgb_features: torch.Tensor, spectral_features: torch.Tensor) -> torch.Tensor:
+        B, N, C = rgb_features.shape
+        if spectral_features is None:
+            return rgb_features
+
+        q = self.query(rgb_features).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.key(spectral_features).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 3, 1)
+        v = self.value(spectral_features).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        attn = (q @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).permute(0, 2, 1, 3).reshape(B, N, C)
+        return self.out(out)
 
 class HierarchicalVisionTransformer(nn.Module):
-    def __init__(self, 
-                 image_size=299, 
-                 patch_size=13, 
-                 num_classes=7, 
-                 dim=768, 
-                 depths=[2, 2, 6], 
-                 heads=[4, 8, 16], 
-                 mlp_ratio=4.0,
-                 multimodal_support=False,
-                 spectral_channels=0,
-                 pretrained=False):
-        super(HierarchicalVisionTransformer, self).__init__()
+    """Hierarchical Vision Transformer with multi-scale and multimodal fusion."""
+    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8], embed_dims: list = [768, 384], num_heads: int = 12, num_layers: int = 12, has_multimodal: bool = False):
+        super().__init__()
+        self.has_multimodal = has_multimodal
+        self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, embed_dims=embed_dims)
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model=sum(embed_dims), nhead=num_heads, dim_feedforward=sum(embed_dims)*4, dropout=0.1)
+            for _ in range(num_layers)
+        ])
+        self.fusion = CrossAttentionFusion(sum(embed_dims)) if has_multimodal else nn.Identity()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, sum(embed_dims)))
+        self.pos_embed = nn.Parameter(torch.zeros(1, sum(embed_dims), img_size // min(patch_sizes), img_size // min(patch_sizes)))
+        self.norm = nn.LayerNorm(sum(embed_dims))
+        self.head = nn.Linear(sum(embed_dims), num_classes)
 
-        assert image_size % patch_size == 0, "Image size must be divisible by patch size"
-        self.patch_size = patch_size
-        self.dim = dim
-        self.multimodal_support = multimodal_support
-        self.use_multimodal = multimodal_support and spectral_channels > 0
+    def forward(self, rgb: torch.Tensor, spectral: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Multi-scale patch embedding
+        multi_scale_features = self.patch_embed(rgb)  # List of tensors [B, C, H, W]
+        combined_features = torch.cat([f.flatten(2).transpose(1, 2) for f in multi_scale_features], dim=-1)
 
-        self.patch_embeds = nn.ModuleList()
-        self.pos_embeds = nn.ParameterList()
-        scales = [1, 2, 4]
-        self.stage_dims = [dim // 3, dim // 2, dim]
+        # Add cls token and positional embedding
+        B = rgb.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        combined_features = torch.cat((cls_tokens, combined_features), dim=1)
+        combined_features += self.pos_embed[:, :, :combined_features.size(1), :].expand(B, -1, -1, -1).flatten(2).transpose(1, 2)
 
-        for i, scale in enumerate(scales):
-            stage_dim = self.stage_dims[i]
-            self.patch_embeds.append(nn.Conv2d(3, stage_dim, kernel_size=patch_size, stride=patch_size))
-            downsampled_size = image_size // scale
-            num_patches = (downsampled_size // patch_size) ** 2
-            pos_embed = nn.Parameter(torch.zeros(1, num_patches, stage_dim))
-            nn.init.trunc_normal_(pos_embed, std=0.02)
-            self.pos_embeds.append(pos_embed)
+        # Transformer encoding
+        for layer in self.transformer_layers:
+            combined_features = layer(combined_features)
 
-        if self.multimodal_support:
-            self.spectral_embed = nn.Linear(spectral_channels, self.stage_dims[-1])
-            self.spectral_pos_embed = nn.Parameter(torch.zeros(1, 1, self.stage_dims[-1]))
-            nn.init.trunc_normal_(self.spectral_pos_embed, std=0.02)
-            self.modal_fusion = MultiModalFusion(
-                rgb_dim=self.stage_dims[-1],
-                spectral_dim=self.stage_dims[-1],
-                fusion_dim=self.stage_dims[-1],
-                num_heads=heads[-1]
-            )
+        # Fusion with spectral data if available
+        if self.has_multimodal and spectral is not None:
+            spectral_flat = spectral.unsqueeze(1).expand(-1, combined_features.size(1), -1)  # Match sequence length
+            combined_features = self.fusion(combined_features, spectral_flat)
 
-        self.layers = nn.ModuleList()
-        for i, (depth, head) in enumerate(zip(depths, heads)):
-            stage_dim = self.stage_dims[i]
-            encoder_layers = []
-            for _ in range(depth):
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=stage_dim,
-                    nhead=head,
-                    dim_feedforward=int(stage_dim * mlp_ratio),
-                    dropout=0.1,
-                    activation="gelu",
-                    batch_first=True
-                )
-                encoder_layers.append(encoder_layer)
-            self.layers.append(nn.ModuleList(encoder_layers))
+        # Classification head
+        cls_output = combined_features[:, 0]
+        cls_output = self.norm(cls_output)
+        return self.head(cls_output)
 
-        self.proj_layers = nn.ModuleList()
-        self.pool_layers = nn.ModuleList()
-        for i in range(len(scales) - 1):
-            current_dim = self.stage_dims[i]
-            next_dim = self.stage_dims[i + 1]
-            current_scale = scales[i]
-            next_scale = scales[i + 1]
-            current_img_size = image_size // current_scale
-            next_img_size = image_size // next_scale
-            current_patches = (current_img_size // patch_size) ** 2
-            next_patches = (next_img_size // patch_size) ** 2
-            self.proj_layers.append(nn.Linear(current_dim, next_dim))
-            self.pool_layers.append(nn.AdaptiveAvgPool1d(next_patches))
+# Step 1: Load Preprocessed Data
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
 
-        self.cross_attentions = nn.ModuleList()
-        for i in range(len(scales) - 1):
-            next_dim = self.stage_dims[i + 1]
-            self.cross_attentions.append(
-                nn.MultiheadAttention(embed_dim=next_dim, num_heads=heads[i+1], batch_first=True)
-            )
+output_dir = 'phase3_hvt_results'
+os.makedirs(output_dir, exist_ok=True)
 
-        self.norm = nn.LayerNorm(self.stage_dims[-1])
-        self.dropout = nn.Dropout(0.3)
-        self.head = nn.Linear(self.stage_dims[-1], num_classes)
-        self.aux_classifiers = nn.ModuleList([nn.Linear(dim, num_classes) for dim in self.stage_dims])
-        
-        if not pretrained:
-            self.apply(self._init_weights)
-        
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
+try:
+    checkpoint = torch.load(os.path.join('./phase1_checkpoints', 'phase1_preprocessed_data.pth'))
+except FileNotFoundError as e:
+    logger.error(f"Preprocessed data not found: {e}")
+    raise FileNotFoundError("Run Phase 1 first to generate preprocessed data.")
 
-    def forward(self, x, spectral_data=None):
-        if torch.any(torch.isnan(x)) or torch.any(torch.isinf(x)):
-            print("NaN/Inf detected in input")
-            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+combined_train_dataset = checkpoint['train_dataset']
+val_dataset = checkpoint['val_dataset']
+test_dataset = checkpoint['test_dataset']
+class_names = checkpoint['class_names']
+has_multimodal = checkpoint['has_multimodal']
 
-        features = []
-        for i, (patch_embed, pos_embed) in enumerate(zip(self.patch_embeds, self.pos_embeds)):
-            scale_factor = 2 ** i
-            if scale_factor > 1:
-                x_scaled = F.interpolate(x, scale_factor=1/scale_factor, mode='bilinear', align_corners=False)
-            else:
-                x_scaled = x
-            x_patched = patch_embed(x_scaled).flatten(2).transpose(1, 2)
-            x_patched = x_patched + pos_embed
-            features.append(x_patched)
+# Adjust class names to 7 classes
+if len(class_names) > 7:
+    class_names = class_names[:-1]
+num_classes = len(class_names)
 
-        stage_outputs = []
-        aux_outputs = []
-        for i, stage_layers in enumerate(self.layers):
-            x_stage = features[i]
-            for layer in stage_layers:
-                x_stage = layer(x_stage)
-                if torch.any(torch.isnan(x_stage)) or torch.any(torch.isinf(x_stage)):
-                    print(f"NaN/Inf in transformer layer {i}")
-                    x_stage = torch.nan_to_num(x_stage, nan=0.0)
-            stage_outputs.append(x_stage)
-            aux_out = self.aux_classifiers[i](x_stage.mean(dim=1))
-            aux_outputs.append(aux_out)
+# Recreate DataLoaders
+train_loader = DataLoader(combined_train_dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
 
-        x = stage_outputs[0]
-        for i in range(len(stage_outputs) - 1):
-            current_features = x
-            fine_features = stage_outputs[i + 1]
-            x_proj = self.proj_layers[i](current_features)
-            x_proj = x_proj.transpose(1, 2)
-            x_proj = self.pool_layers[i](x_proj).transpose(1, 2)
-            x_att, _ = self.cross_attentions[i](query=x_proj, key=fine_features, value=fine_features)
-            if torch.any(torch.isnan(x_att)) or torch.any(torch.isinf(x_att)):
-                print(f"NaN/Inf in cross_attention layer {i}")
-                x_att = torch.nan_to_num(x_att, nan=0.0)
-            x = x_att + x_proj
+logger.info(f"Training set size: {len(combined_train_dataset)}")
+logger.info(f"Validation set size: {len(val_dataset)}")
+logger.info(f"Test set size: {len(test_dataset)}")
 
-        if self.use_multimodal and spectral_data is not None:
-            spectral_features = self.spectral_embed(spectral_data)
-            spectral_features = spectral_features + self.spectral_pos_embed
-            x = self.modal_fusion(x, spectral_features)
-
-        x = self.norm(x)
-        x = x.mean(dim=1)
-        x = self.dropout(x)
-        x = self.head(x)
-        
-        if self.training:
-            return x, aux_outputs
-        return x
-
-# Initialize model
-spectral_channels = 0
-if has_multimodal:
-    try:
-        _, spectral_sample, _ = combined_train_dataset.data[0]
-        spectral_channels = spectral_sample.shape[0]
-        print(f"Detected {spectral_channels} spectral channels")
-    except:
-        print("Could not determine spectral channels. Defaulting to RGB-only model.")
-
+# Step 2: Initialize HVT Model
 model = HierarchicalVisionTransformer(
-    image_size=299, 
-    patch_size=13, 
-    num_classes=7,
-    dim=768,
-    depths=[2, 2, 6], 
-    heads=[4, 8, 16],
-    mlp_ratio=4.0,
-    multimodal_support=True,
-    spectral_channels=spectral_channels,
-    pretrained=True
-)
+    num_classes=num_classes,
+    img_size=299,
+    patch_sizes=[16, 8],
+    embed_dims=[768, 384],
+    num_heads=12,
+    num_layers=12,
+    has_multimodal=has_multimodal
+).to(device)
+logger.info(f"HVT model initialized with {sum(p.numel() for p in model.parameters() / 1e6):.2f}M parameters.")
 
-pretrained_path = '/teamspace/studios/this_studio/best_simclr_pretrained.pth'
-if os.path.exists(pretrained_path):
-    pretrained_state_dict = torch.load(pretrained_path)
-    model_dict = model.state_dict()
-    pretrained_state_dict = {k: v for k, v in pretrained_state_dict.items() if k in model_dict and 'projection_head' not in k}
-    model_dict.update(pretrained_state_dict)
-    model.load_state_dict(model_dict, strict=False)
-    print(f"Loaded pretrained weights from {pretrained_path} with strict=False")
-else:
-    print(f"Warning: Pretrained model {pretrained_path} not found. Training from scratch.")
-    model.apply(model._init_weights)
+# Step 3: Define Loss, Optimizer, and Scheduler
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-6)
+scaler = GradScaler() if torch.cuda.is_available() else None
 
-for param in model.patch_embeds.parameters():
-    param.requires_grad = False
-for param in model.layers[0].parameters():
-    param.requires_grad = False
-
-model = model.to(device)
-
-train_class_weights = calculate_class_weights(combined_train_dataset)
-print("Class weights:", train_class_weights)
-
-criterion = nn.CrossEntropyLoss(weight=train_class_weights)
-
-# Load checkpoint from epoch 25 and reinitialize optimizer
-checkpoint_path = 'checkpoint_epoch_25.pth'
-model.load_state_dict(torch.load(checkpoint_path))
-print("Loaded checkpoint from epoch 25")
-optimizer = Adam(model.parameters(), lr=0.000005, weight_decay=1e-3)  # Lower LR
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
-scaler = GradScaler()  # For mixed precision
-
+# Step 4: Training Loop with Early Stopping and Mixed Precision
 num_epochs = 50
-best_val_loss = 0.6762  # Best from epoch 23, but resuming from 25
-best_model_path = 'best_hierarchical_vit_finetuned.pth'
-patience = 5
+best_val_acc = 0.0
+best_model_path = os.path.join(output_dir, 'best_hvt.pth')
+patience = 10
 trigger_times = 0
+history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
-for epoch in range(26, num_epochs):  # Resume from epoch 26
+start_time = time.time()
+
+for epoch in range(num_epochs):
     model.train()
-    train_loss = 0.0
-    train_correct = 0
-    train_total = 0
+    train_loss, train_correct, train_total = 0.0, 0, 0
 
-    for batch_idx, batch in enumerate(train_loader):
-        if has_multimodal:
-            images, spectral, labels = [item.to(device) for item in batch]
-        else:
-            images, labels = [item.to(device) for item in batch]
-        
-        if torch.any(torch.isnan(images)) or torch.any(torch.isinf(images)):
-            print(f"Skipping batch {batch_idx} due to NaN/Inf in input")
-            continue
-        
+    for rgb, spectral, labels in train_loader:
+        rgb, labels = rgb.to(device), labels.to(device)
+        spectral = spectral.to(device) if spectral is not None else None
         optimizer.zero_grad()
-        with autocast():  # Mixed precision
-            outputs, aux_outputs = model(images, spectral if has_multimodal else None)
-            if torch.any(torch.isnan(outputs)) or torch.any(torch.isinf(outputs)):
-                print(f"NaN/Inf in outputs at batch {batch_idx}")
-                continue
-            
-            main_loss = criterion(outputs, labels)
-            aux_loss = 0
-            for aux_out in aux_outputs:
-                aux_loss += criterion(aux_out, labels) * 0.1
-            loss = main_loss + aux_loss
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"NaN/Inf in loss at batch {batch_idx}")
-            continue
-        
-        loss = torch.clamp(loss, max=100.0)
-        scaler.scale(loss).backward()  # Scale gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.05)  # Stricter clipping
-        scaler.step(optimizer)
-        scaler.update()
+
+        with autocast() if scaler else torch.no_grad():
+            outputs = model(rgb, spectral)
+            loss = criterion(outputs, labels)
+
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         train_loss += loss.item()
         _, predicted = torch.max(outputs.data, 1)
         train_total += labels.size(0)
         train_correct += (predicted == labels).sum().item()
 
-    train_loss = train_loss / len(train_loader)
+    train_loss /= len(train_loader)
     train_accuracy = 100 * train_correct / train_total
+    history['train_loss'].append(train_loss)
+    history['train_acc'].append(train_accuracy)
 
+    # Validation
     model.eval()
-    val_loss = 0.0
-    val_correct = 0
-    val_total = 0
+    val_loss, val_correct, val_total = 0.0, 0, 0
 
     with torch.no_grad():
-        for batch in val_loader:
-            if has_multimodal:
-                images, spectral, labels = [item.to(device) for item in batch]
-            else:
-                images, labels = [item.to(device) for item in batch]
-            with autocast():
-                outputs = model(images, spectral if has_multimodal else None)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
+        for rgb, spectral, labels in val_loader:
+            rgb, labels = rgb.to(device), labels.to(device)
+            spectral = spectral.to(device) if spectral is not None else None
+            with autocast() if scaler else torch.no_grad():
+                outputs = model(rgb, spectral)
                 loss = criterion(outputs, labels)
             val_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
             val_total += labels.size(0)
             val_correct += (predicted == labels).sum().item()
 
-    val_loss = val_loss / len(val_loader)
+    val_loss /= len(val_loader)
     val_accuracy = 100 * val_correct / val_total
+    history['val_loss'].append(val_loss)
+    history['val_acc'].append(val_accuracy)
 
-    scheduler.step(val_loss)
+    scheduler.step()
+    logger.info(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
+                f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
 
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        torch.save(model.state_dict(), best_model_path)
-        print(f"Best model saved at epoch {epoch+1} with val_loss: {val_loss:.4f}")
+    if val_accuracy > best_val_acc:
+        best_val_acc = val_accuracy
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_accuracy': val_accuracy
+        }, best_model_path)
+        logger.info(f"Best model saved at epoch {epoch+1} with val_acc: {val_accuracy:.2f}%")
         trigger_times = 0
     else:
         trigger_times += 1
         if trigger_times >= patience:
-            print(f"Early stopping triggered at epoch {epoch+1}")
+            logger.info(f"Early stopping triggered at epoch {epoch+1}")
             break
 
-    if (epoch + 1) % 5 == 0:
-        torch.save(model.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
-        print(f"Checkpoint saved at epoch {epoch+1}")
-        model.eval()
-        test_loss = 0.0
-        test_correct = 0
-        test_total = 0
-        with torch.no_grad():
-            for batch in test_loader:
-                if has_multimodal:
-                    images, spectral, labels = [item.to(device) for item in batch]
-                else:
-                    images, labels = [item.to(device) for item in batch]
-                with autocast():
-                    outputs = model(images, spectral if has_multimodal else None)
-                    if isinstance(outputs, tuple):
-                        outputs = outputs[0]
-                    loss = criterion(outputs, labels)
-                test_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                test_total += labels.size(0)
-                test_correct += (predicted == labels).sum().item()
-        test_loss = test_loss / len(test_loader)
-        test_accuracy = 100 * test_correct / test_total
-        print(f"Test Loss at epoch {epoch+1}: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%")
+training_time = time.time() - start_time
+logger.info(f"Training completed in {training_time/60:.2f} minutes")
 
-    print(f"Epoch [{epoch+1}/{num_epochs}] - LR: {optimizer.param_groups[0]['lr']:.8f}, "
-          f"Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
-          f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
+# Plot training history
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history['train_loss'], label='Train Loss')
+plt.plot(history['val_loss'], label='Validation Loss')
+plt.title('Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
 
-model.load_state_dict(torch.load(best_model_path))
+plt.subplot(1, 2, 2)
+plt.plot(history['train_acc'], label='Train Accuracy')
+plt.plot(history['val_acc'], label='Validation Accuracy')
+plt.title('Accuracy over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, 'training_history.png'))
+plt.close()
+
+# Step 5: Evaluate on Test Set
+checkpoint = torch.load(best_model_path)
+model.load_state_dict(checkpoint['model_state_dict'])
+logger.info(f"Loaded best model from epoch {checkpoint['epoch']+1} with validation accuracy: {checkpoint['val_accuracy']:.2f}%")
+
 model.eval()
-
-test_correct = 0
-test_total = 0
-test_loss = 0.0
+test_correct, test_total, test_loss = 0, 0, 0.0
+all_preds, all_labels = [], []
 
 with torch.no_grad():
-    for batch in test_loader:
-        if has_multimodal:
-            images, spectral, labels = [item.to(device) for item in batch]
-        else:
-            images, labels = [item.to(device) for item in batch]
-        with autocast():
-            outputs = model(images, spectral if has_multimodal else None)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
+    for rgb, spectral, labels in test_loader:
+        rgb, labels = rgb.to(device), labels.to(device)
+        spectral = spectral.to(device) if spectral is not None else None
+        with autocast() if scaler else torch.no_grad():
+            outputs = model(rgb, spectral)
             loss = criterion(outputs, labels)
         test_loss += loss.item()
         _, predicted = torch.max(outputs.data, 1)
         test_total += labels.size(0)
         test_correct += (predicted == labels).sum().item()
-
-test_loss = test_loss / len(test_loader)
-test_accuracy = 100 * test_correct / test_total
-print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%")
-
-all_preds = []
-all_labels = []
-
-model.eval()
-with torch.no_grad():
-    for batch in test_loader:
-        if has_multimodal:
-            images, spectral, labels = [item.to(device) for item in batch]
-        else:
-            images, labels = [item.to(device) for item in batch]
-        with autocast():
-            outputs = model(images, spectral if has_multimodal else None)
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-            _, predicted = torch.max(outputs.data, 1)
         all_preds.extend(predicted.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
-class_names = ['Bacterial Blight', 'Curl Virus', 'Healthy Leaf', 'Herbicide Growth Damage',
-               'Leaf Hopper Jassids', 'Leaf Redding', 'Leaf Variegation']
-print("\nClassification Report:")
+test_loss /= len(test_loader)
+test_accuracy = 100 * test_correct / test_total
+logger.info(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.2f}%")
+
+# Detailed Evaluation
+logger.info("\nPer-class accuracy:")
+class_correct = [0] * num_classes
+class_total = [0] * num_classes
+for pred, label in zip(all_preds, all_labels):
+    class_total[label] += 1
+    if pred == label:
+        class_correct[label] += 1
+for i in range(num_classes):
+    if class_total[i] > 0:
+        class_acc = 100 * class_correct[i] / class_total[i]
+        logger.info(f"{class_names[i]}: {class_acc:.2f}% ({class_correct[i]}/{class_total[i]})")
+
+logger.info("\nClassification Report:")
 print(classification_report(all_labels, all_preds, target_names=class_names))
 
-explainability_samples = 10
-attention_fig = plt.figure(figsize=(20, 10))
-for i in range(min(explainability_samples, len(test_dataset))):
-    if has_multimodal:
-        image, spectral, label = test_dataset[i]
-        image = image.unsqueeze(0).to(device)
-        spectral = spectral.unsqueeze(0).to(device)
-        with torch.no_grad():
-            with autocast():
-                output = model(image, spectral)
-    else:
-        image, label = test_dataset[i]
-        image = image.unsqueeze(0).to(device)
-        with torch.no_grad():
-            with autocast():
-                output = model(image)
-            
-    if isinstance(output, tuple):
-        output = output[0]
-        
-    _, predicted = torch.max(output.data, 1)
-    
-    plt.subplot(2, 5, i+1)
-    img_np = image.squeeze().cpu().permute(1, 2, 0).numpy()
-    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    plt.imshow(img_np)
-    plt.title(f"True: {class_names[label]}\nPred: {class_names[predicted.item()]}")
-    plt.axis('off')
-
+cm = confusion_matrix(all_labels, all_preds)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.xticks(rotation=45, ha='right')
 plt.tight_layout()
-plt.savefig('model_predictions_finetuned.png')
-print("Saved sample predictions visualization")
+plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
+plt.close()
+
+# Save results
+with open(os.path.join(output_dir, 'results_summary.txt'), 'w') as f:
+    f.write(f"HVT Results\n\n")
+    f.write(f"Training time: {training_time/60:.2f} minutes\n")
+    f.write(f"Best validation accuracy: {best_val_acc:.2f}%\n")
+    f.write(f"Test accuracy: {test_accuracy:.2f}%\n")
+    f.write("\nPer-class accuracy:\n")
+    for i in range(num_classes):
+        if class_total[i] > 0:
+            f.write(f"{class_names[i]}: {100 * class_correct[i] / class_total[i]:.2f}% ({class_correct[i]}/{class_total[i]})\n")
+    f.write("\nClassification Report:\n")
+    report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
+    for cls in class_names:
+        f.write(f"{cls}:\n{report[str(class_names.index(cls))]}\n")
 
 torch.save({
     'model_state_dict': model.state_dict(),
-    'class_names': class_names,
     'test_accuracy': test_accuracy,
-    'classification_report': classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
-}, 'hierarchical_vit_finetuned_results.pth')
-print("Saved complete model results")
+    'class_report': report,
+    'confusion_matrix': cm,
+    'training_history': history
+}, os.path.join(output_dir, 'hvt_model.pth'))
+
+logger.info(f"Phase 3 complete! HVT model trained and evaluated with test accuracy: {test_accuracy:.2f}%")
+logger.info(f"Results saved to {output_dir}/")
