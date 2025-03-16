@@ -1,4 +1,3 @@
-# data_utils.py
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,20 +14,39 @@ import cv2  # For edge detection to analyze occlusions
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Simulate spectral data using NDVI
+def simulate_spectral_from_rgb(img):
+    """
+    Simulate spectral data by computing NDVI from RGB channels.
+    Args:
+        img (PIL.Image): Input RGB image.
+    Returns:
+        PIL.Image: Simulated spectral image (NDVI).
+    """
+    img = np.array(img) / 255.0
+    R, G, B = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    NDVI = (G - R) / (G + R + 1e-5)  # Avoid division by zero
+    NDVI = (NDVI + 1) / 2  # Normalize to [0, 1]
+    NDVI = Image.fromarray((NDVI * 255).astype(np.uint8))
+    return NDVI
+
 # Custom Dataset Class for Cotton Leaf Disease Detection
 class CottonLeafDataset(Dataset):
-    def __init__(self, samples, transform=None, return_paths=False, spectral_path=None):
+    def __init__(self, samples, transform=None, rare_transform=None, rare_classes=None, return_paths=False, spectral_path=None):
         """
-        Custom dataset for cotton leaf disease detection with multimodal support.
-
+        Custom dataset for cotton leaf disease detection with multimodal support and class-specific augmentations.
         Args:
             samples (list): List of (image_path, label) tuples.
-            transform (callable, optional): Transformations to apply to the images.
+            transform (callable, optional): Transformations for non-rare classes.
+            rare_transform (callable, optional): Transformations for rare classes.
+            rare_classes (list, optional): List of indices of rare classes.
             return_paths (bool): If True, return image paths along with data.
             spectral_path (str, optional): Path to spectral dataset.
         """
         self.samples = samples
         self.transform = transform
+        self.rare_transform = rare_transform
+        self.rare_classes = rare_classes or []
         self.return_paths = return_paths
         self.spectral_path = spectral_path
         self.spectral_data = None
@@ -38,7 +56,7 @@ class CottonLeafDataset(Dataset):
             self.spectral_data = datasets.ImageFolder(root=spectral_path).samples
             self.has_multimodal = True
         elif not spectral_path:
-            logger.warning("Spectral data not found. Simulating grayscale as placeholder.")
+            logger.warning("Spectral data not found. Simulating NDVI as placeholder.")
             self.spectral_data = [(s[0], s[1]) for s in samples]
             self.has_multimodal = True
 
@@ -59,11 +77,14 @@ class CottonLeafDataset(Dataset):
                     spectral_path, _ = self.spectral_data[idx]
                     spectral = Image.open(spectral_path).convert('L')
                 else:
-                    spectral = img.convert('L')
+                    spectral = simulate_spectral_from_rgb(img)
                 spectral = transforms.Resize((299, 299))(spectral)
                 spectral = transforms.ToTensor()(spectral).squeeze(0)
 
-            if self.transform:
+            # Apply class-specific transforms
+            if label in self.rare_classes and self.rare_transform:
+                img = self.rare_transform(img)
+            elif self.transform:
                 img = self.transform(img)
 
             if self.return_paths:
@@ -82,12 +103,10 @@ class CottonLeafDataset(Dataset):
 def analyze_dataset(data_path, dataset_type="Original", save_path="./analysis"):
     """
     Analyze the dataset to understand class distribution, image properties, and field condition variability.
-
     Args:
         data_path (str): Path to the dataset.
         dataset_type (str): Type of dataset (e.g., "Original", "Augmented").
         save_path (str): Directory to save analysis visualizations.
-
     Returns:
         dict: Statistics including class distribution, corrupt images, and field condition variability.
     """
@@ -103,8 +122,8 @@ def analyze_dataset(data_path, dataset_type="Original", save_path="./analysis"):
     class_counts = np.zeros(len(class_names), dtype=int)
     img_sizes = []
     corrupt_images = []
-    lighting_variability = []  # To measure pixel intensity for lighting analysis
-    occlusion_variability = []  # To measure edge density for occlusion analysis
+    lighting_variability = []
+    occlusion_variability = []
 
     for path, class_idx in dataset.samples:
         class_counts[class_idx] += 1
@@ -129,11 +148,15 @@ def analyze_dataset(data_path, dataset_type="Original", save_path="./analysis"):
     class_distribution = {class_names[i]: (count, count / total_images * 100) 
                          for i, count in enumerate(class_counts)}
 
+    # Compute class imbalance ratio
+    class_imbalance_ratio = max(class_counts) / min(class_counts) if min(class_counts) > 0 else float('inf')
+
     # Log statistics
     logger.info(f"{dataset_type} dataset - Total images: {total_images}")
     logger.info(f"\n{dataset_type} Class distribution:")
     for class_name, (count, percentage) in class_distribution.items():
         logger.info(f"{class_name}: {count} images ({percentage:.2f}%)")
+    logger.info(f"Class imbalance ratio: {class_imbalance_ratio:.2f}")
 
     if img_sizes:
         widths, heights = zip(*img_sizes)
@@ -177,27 +200,35 @@ def analyze_dataset(data_path, dataset_type="Original", save_path="./analysis"):
         'corrupt_images': corrupt_images,
         'img_sizes': img_sizes,
         'lighting_variability': lighting_variability,
-        'occlusion_variability': occlusion_variability
+        'occlusion_variability': occlusion_variability,
+        'class_imbalance_ratio': class_imbalance_ratio
     }
 
 # Load and Split Dataset with Corrupt Image Handling
-def load_and_split_dataset(root_path, train_transform, val_test_transform, spectral_path=None, corrupt_images=None):
+def load_and_split_dataset(root_path, train_transform, rare_transform, val_test_transform, spectral_path=None, corrupt_images=None, rare_class_threshold=200):
     """
     Load and split the dataset into train, validation, and test sets with stratified sampling.
-
     Args:
         root_path (str): Path to the dataset.
-        train_transform (callable): Transformations for training data.
+        train_transform (callable): Transformations for training data (non-rare classes).
+        rare_transform (callable): Transformations for rare classes.
         val_test_transform (callable): Transformations for validation/test data.
         spectral_path (str, optional): Path to spectral dataset.
         corrupt_images (list, optional): List of corrupt image paths to exclude.
-
+        rare_class_threshold (int): Threshold to identify rare classes (based on sample count).
     Returns:
-        tuple: (train_dataset, val_dataset, test_dataset, class_names)
+        tuple: (train_dataset, val_dataset, test_dataset, class_names, rare_classes)
     """
     dataset = datasets.ImageFolder(root=root_path)
     class_names = dataset.classes
     all_samples = dataset.samples
+
+    # Identify rare classes
+    class_counts = np.zeros(len(class_names), dtype=int)
+    for _, label in all_samples:
+        class_counts[label] += 1
+    rare_classes = [i for i, count in enumerate(class_counts) if count < rare_class_threshold]
+    logger.info(f"Rare classes (less than {rare_class_threshold} samples): {[class_names[i] for i in rare_classes]}")
 
     # Exclude corrupt images
     if corrupt_images is None:
@@ -240,23 +271,32 @@ def load_and_split_dataset(root_path, train_transform, val_test_transform, spect
     val_samples = [valid_samples[i] for i in val_idx]
     test_samples = [valid_samples[i] for i in test_idx]
 
-    train_dataset = CottonLeafDataset(train_samples, transform=train_transform, spectral_path=spectral_path)
-    val_dataset = CottonLeafDataset(val_samples, transform=val_test_transform, spectral_path=spectral_path)
-    test_dataset = CottonLeafDataset(test_samples, transform=val_test_transform, spectral_path=spectral_path)
+    train_dataset = CottonLeafDataset(
+        train_samples, transform=train_transform, rare_transform=rare_transform, 
+        rare_classes=rare_classes, spectral_path=spectral_path
+    )
+    val_dataset = CottonLeafDataset(
+        val_samples, transform=val_test_transform, rare_transform=None, 
+        rare_classes=rare_classes, spectral_path=spectral_path
+    )
+    test_dataset = CottonLeafDataset(
+        test_samples, transform=val_test_transform, rare_transform=None, 
+        rare_classes=rare_classes, spectral_path=spectral_path
+    )
 
-    return train_dataset, val_dataset, test_dataset, class_names
+    return train_dataset, val_dataset, test_dataset, class_names, rare_classes
 
 # Load Augmented Dataset
-def load_augmented_dataset(root_path, transform, spectral_path=None, corrupt_images=None):
+def load_augmented_dataset(root_path, transform, rare_transform, rare_classes, spectral_path=None, corrupt_images=None):
     """
     Load the augmented dataset.
-
     Args:
         root_path (str): Path to the augmented dataset.
-        transform (callable): Transformations to apply.
+        transform (callable): Transformations for non-rare classes.
+        rare_transform (callable): Transformations for rare classes.
+        rare_classes (list): List of indices of rare classes.
         spectral_path (str, optional): Path to spectral dataset.
         corrupt_images (list, optional): List of corrupt image paths to exclude.
-
     Returns:
         CottonLeafDataset: Augmented dataset.
     """
@@ -264,13 +304,15 @@ def load_augmented_dataset(root_path, transform, spectral_path=None, corrupt_ima
     if corrupt_images is None:
         corrupt_images = []
     valid_samples = [(path, label) for path, label in dataset.samples if path not in {p for p, _ in corrupt_images}]
-    return CottonLeafDataset(valid_samples, transform=transform, spectral_path=spectral_path)
+    return CottonLeafDataset(
+        valid_samples, transform=transform, rare_transform=rare_transform, 
+        rare_classes=rare_classes, spectral_path=spectral_path
+    )
 
 # Visualization Function
 def visualize_batch(dataloader, n_samples=16, title="Sample Images", has_multimodal=False, save_path="./visualizations"):
     """
     Visualize a batch of images from the dataloader.
-
     Args:
         dataloader (DataLoader): DataLoader to visualize.
         n_samples (int): Number of samples to display.
@@ -295,13 +337,12 @@ def visualize_batch(dataloader, n_samples=16, title="Sample Images", has_multimo
     except Exception as e:
         logger.error(f"Failed to visualize batch: {e}")
 
-# Define Standard Transformations
+# Define Standard Transformations with Class-Specific Augmentations
 def get_transforms():
     """
-    Define standard transformations for training, validation, and test sets.
-
+    Define transformations for training, validation, and test sets, including rare class-specific augmentations.
     Returns:
-        tuple: (train_transforms, val_test_transforms)
+        tuple: (train_transforms, rare_transforms, val_test_transforms)
     """
     train_transforms = transforms.Compose([
         transforms.Resize((320, 320)),
@@ -314,25 +355,34 @@ def get_transforms():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
+    rare_transforms = transforms.Compose([
+        transforms.Resize((320, 320)),
+        transforms.RandomCrop((299, 299)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.3),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),  # Enhanced for rare classes
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
     val_test_transforms = transforms.Compose([
         transforms.Resize((299, 299)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    return train_transforms, val_test_transforms
+    return train_transforms, rare_transforms, val_test_transforms
 
 # Utility to Create DataLoaders
 def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=32):
     """
     Create DataLoaders for train, validation, and test datasets.
-
     Args:
         train_dataset (Dataset): Training dataset.
         val_dataset (Dataset): Validation dataset.
         test_dataset (Dataset): Test dataset.
         batch_size (int): Batch size for DataLoaders.
-
     Returns:
         tuple: (train_loader, val_loader, test_loader)
     """
@@ -364,7 +414,6 @@ def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=32):
     return train_loader, val_loader, test_loader
 
 if __name__ == "__main__":
-    # Example usage
     DATA_ROOT = "/teamspace/studios/this_studio/cvpr25/SAR-CLD-2024 A Comprehensive Dataset for Cotton Leaf Disease Detection"
     if not os.path.exists(DATA_ROOT):
         logger.error(f"Dataset root {DATA_ROOT} not found.")
@@ -375,15 +424,16 @@ if __name__ == "__main__":
     augmented_stats = analyze_dataset(os.path.join(DATA_ROOT, "Augmented Dataset"), "Augmented")
 
     # Get transformations
-    train_transforms, val_test_transforms = get_transforms()
+    train_transforms, rare_transforms, val_test_transforms = get_transforms()
 
     # Load and split dataset
     spectral_path = os.path.join(DATA_ROOT, "Spectral Dataset")
     if not os.path.exists(spectral_path):
         spectral_path = None
-    original_train_dataset, original_val_dataset, original_test_dataset, class_names = load_and_split_dataset(
+    original_train_dataset, original_val_dataset, original_test_dataset, class_names, rare_classes = load_and_split_dataset(
         os.path.join(DATA_ROOT, "Original Dataset"),
         train_transforms,
+        rare_transforms,
         val_test_transforms,
         spectral_path,
         corrupt_images=original_stats['corrupt_images']
@@ -393,6 +443,8 @@ if __name__ == "__main__":
     augmented_dataset = load_augmented_dataset(
         os.path.join(DATA_ROOT, "Augmented Dataset"),
         train_transforms,
+        rare_transforms,
+        rare_classes,
         spectral_path,
         corrupt_images=augmented_stats['corrupt_images']
     )
@@ -401,6 +453,8 @@ if __name__ == "__main__":
     combined_train_dataset = CottonLeafDataset(
         original_train_dataset.samples + augmented_dataset.samples,
         transform=train_transforms,
+        rare_transform=rare_transforms,
+        rare_classes=rare_classes,
         spectral_path=spectral_path
     )
 
