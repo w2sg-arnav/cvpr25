@@ -68,7 +68,7 @@ class FocalLoss(nn.Module):
 
 # Hierarchical Vision Transformer (HVT) Components
 class MultiScalePatchEmbed(nn.Module):
-    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[1024, 512, 264]):
+    def __init__(self, img_size=299, patch_sizes=[16, 8, 4], in_channels=3, embed_dims=[768, 384, 192]):
         super().__init__()
         self.patch_sizes = patch_sizes
         self.embed_dims = embed_dims
@@ -119,7 +119,7 @@ class CrossAttentionFusion(nn.Module):
         return self.out(out)
 
 class TransformerEncoderLayerWithResidual(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.3, drop_path_rate=0.1):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.4, drop_path_rate=0.2):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -157,19 +157,19 @@ class DropPath(nn.Module):
         return output
 
 class HierarchicalVisionTransformer(nn.Module):
-    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [1024, 512, 264], num_heads: int = 24, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):
+    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [768, 384, 192], num_heads: int = 24, num_layers: int = 12, has_multimodal: bool = False, spectral_dim: int = 299):
         super().__init__()
         self.has_multimodal = has_multimodal
         self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, embed_dims=embed_dims)
-        self.embed_dim_total = sum(embed_dims)  # 1800, divisible by 24
+        self.embed_dim_total = sum(embed_dims)  # 1344, divisible by 24
         
         self.transformer_layers = nn.ModuleList([
             TransformerEncoderLayerWithResidual(
                 d_model=self.embed_dim_total, 
                 nhead=num_heads, 
                 dim_feedforward=self.embed_dim_total*4, 
-                dropout=0.3,  # Increased dropout
-                drop_path_rate=0.1  # Stochastic depth
+                dropout=0.4,  # Increased dropout
+                drop_path_rate=0.2  # Increased stochastic depth
             ) for _ in range(num_layers)
         ])
         
@@ -262,7 +262,7 @@ def tta_inference(model, image, spectral=None, num_augments=5, device='cuda'):
 
 # Gradient Centralization for AdamW
 class AdamWGC(optim.AdamW):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=5e-3):
         super().__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
 
     def step(self, closure=None):
@@ -311,7 +311,6 @@ if len(class_names) > 7:
 num_classes = len(class_names)
 
 # Define data augmentation transform with RandAugment (optimized for tensor input)
-# Split the transform into two parts: augmentation (needs uint8) and normalization (needs float32)
 train_augmentation = transforms.Compose([
     transforms.Lambda(lambda x: (x * 255).clamp(0, 255).to(torch.uint8) if isinstance(x, torch.Tensor) else x),  # Ensure uint8 for augmentation
     transforms.RandomResizedCrop(size=299, scale=(0.7, 1.0), interpolation=transforms.InterpolationMode.BILINEAR),
@@ -414,9 +413,9 @@ model = HierarchicalVisionTransformer(
     num_classes=num_classes,
     img_size=299,
     patch_sizes=[16, 8, 4],
-    embed_dims=[1024, 512, 264],
+    embed_dims=[768, 384, 192],
     num_heads=24,
-    num_layers=16,
+    num_layers=12,
     has_multimodal=has_multimodal,
     spectral_dim=299
 )
@@ -436,18 +435,18 @@ logger.info(f"HVT model initialized with {sum(p.numel() for p in model.parameter
 # Step 3: Define Loss, Optimizer, and Scheduler with Layer-Specific Learning Rates
 criterion = FocalLoss(gamma=2.5, alpha=class_weights, label_smoothing=0.1)
 optimizer = AdamWGC([
-    {'params': [p for n, p in model.named_parameters() if 'patch_embed' in n], 'lr': 1e-5},
-    {'params': [p for n, p in model.named_parameters() if 'transformer_layers.0' in n or 'transformer_layers.1' in n], 'lr': 3e-5},
-    {'params': [p for n, p in model.named_parameters() if 'transformer_layers' in n and not any(f'transformer_layers.{i}' in n for i in [0,1])], 'lr': 5e-5},
-    {'params': [p for n, p in model.named_parameters() if 'head' in n], 'lr': 5e-4}
-], weight_decay=2e-3)
+    {'params': [p for n, p in model.named_parameters() if 'patch_embed' in n], 'lr': 2e-5},
+    {'params': [p for n, p in model.named_parameters() if 'transformer_layers.0' in n or 'transformer_layers.1' in n], 'lr': 6e-5},
+    {'params': [p for n, p in model.named_parameters() if 'transformer_layers' in n and not any(f'transformer_layers.{i}' in n for i in [0,1])], 'lr': 1e-4},
+    {'params': [p for n, p in model.named_parameters() if 'head' in n], 'lr': 1e-3}
+], weight_decay=5e-3)
 
 scheduler = OneCycleLR(
     optimizer,
-    max_lr=[1e-5, 3e-5, 5e-5, 5e-4],
+    max_lr=[2e-5, 6e-5, 1e-4, 1e-3],
     steps_per_epoch=len(train_loader) // accumulation_steps,
     epochs=100,
-    pct_start=0.1
+    pct_start=0.3  # Extended warmup phase
 )
 scaler = GradScaler()
 
@@ -492,7 +491,7 @@ for epoch in range(num_epochs):
         if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()  # Moved after optimizer.step()
 
         train_loss += loss.item() * accumulation_steps
         _, predicted = torch.max(outputs.data, 1)
@@ -530,8 +529,6 @@ for epoch in range(num_epochs):
     history['val_loss'].append(val_loss)
     history['val_acc'].append(val_accuracy)
 
-    scheduler.step()
-    
     logger.info(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, "
                 f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
 
