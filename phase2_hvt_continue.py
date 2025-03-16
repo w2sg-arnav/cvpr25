@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import models
-from torchvision.models import Inception_V3_Weights
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -54,9 +53,9 @@ class_weights = 1.0 / (class_counts / class_counts.sum())
 class_weights = torch.FloatTensor(class_weights).to(device)
 logger.info(f"Class weights: {class_weights.tolist()}")
 
-# Baseline Inception V3 Model
-def get_inception_v3_model(num_classes, weights=Inception_V3_Weights.IMAGENET1K_V1):
-    model = models.inception_v3(weights=weights)
+# Baseline Inception V3 Model (for loading existing checkpoint)
+def get_inception_v3_model(num_classes, weights=None):
+    model = models.inception_v3(weights=weights, init_weights=False)
     model.aux_logits = False  # Disable auxiliary logits for simplicity
     num_ftrs = model.fc.in_features
     model.fc = nn.Linear(num_ftrs, num_classes)
@@ -173,8 +172,11 @@ class HierarchicalVisionTransformer(nn.Module):
             features = self.dropout(features)
             
             if spectral is not None and self.spectral_embed is not None:
-                spectral_features = self.spectral_embed(spectral.unsqueeze(-1))
-                spectral_features = spectral_features.expand(-1, features.shape[1], -1)
+                # Global average pooling to reduce spectral to [B, embed_dim]
+                spectral_pooled = F.adaptive_avg_pool2d(spectral, (1, 1)).view(B, -1)  # [B, 1] -> [B, embed_dim]
+                spectral_features = self.spectral_embed(spectral_pooled)  # [B, embed_dim]
+                # Expand spectral_features to match the sequence length of features
+                spectral_features = spectral_features.unsqueeze(1).expand(-1, features.shape[1], -1)
                 features = self.cross_attention(features, spectral_features)
             
             for layer in self.transformer_layers:
@@ -182,10 +184,10 @@ class HierarchicalVisionTransformer(nn.Module):
             
             features = self.norm(features)
             cls_output = features[:, 0]  # Extract CLS token
-            scale_outputs.append(cls_output)  # Should be [B, embed_dim]
+            scale_outputs.append(cls_output)  # Append CLS token with shape [B, embed_dim]
         
         # Concatenate scale outputs along the feature dimension
-        combined_features = torch.cat(scale_outputs, dim=-1)  # Should be [B, embed_dim * len(patch_sizes)]
+        combined_features = torch.cat(scale_outputs, dim=-1)  # Should result in [B, embed_dim * len(patch_sizes)]
         fused_features = self.fusion_head(combined_features)
         logits = self.head(fused_features)
         return logits
@@ -205,8 +207,9 @@ class HierarchicalVisionTransformer(nn.Module):
                 features = self.dropout(features)
                 
                 if spectral is not None and self.spectral_embed is not None:
-                    spectral_features = self.spectral_embed(spectral.unsqueeze(-1))
-                    spectral_features = spectral_features.expand(-1, features.shape[1], -1)
+                    spectral_pooled = F.adaptive_avg_pool2d(spectral, (1, 1)).view(B, -1)
+                    spectral_features = self.spectral_embed(spectral_pooled)
+                    spectral_features = spectral_features.unsqueeze(1).expand(-1, features.shape[1], -1)
                     features = self.cross_attention(features, spectral_features)
                 
                 for layer in self.transformer_layers:
@@ -219,7 +222,7 @@ class HierarchicalVisionTransformer(nn.Module):
             return attention_weights
 
 # Training Function
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, model_name="HVT"):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, model_name="HVT"):
     scaler = GradScaler()
     best_val_acc = 0.0
     best_model_path = f"./phase2_checkpoints/{model_name}_best.pth"
@@ -248,6 +251,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 loss = criterion(outputs, labels)
             
             scaler.scale(loss).backward()
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
@@ -266,6 +272,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_loss = 0.0
         correct = 0
         total = 0
+        class_correct = torch.zeros(num_classes).to(device)
+        class_total = torch.zeros(num_classes).to(device)
+        
         with torch.no_grad():
             for batch in val_loader:
                 inputs = batch[0].to(device)
@@ -283,11 +292,26 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
+                
+                # Per-class accuracy
+                for label, pred in zip(labels, predicted):
+                    if label == pred:
+                        class_correct[label] += 1
+                    class_total[label] += 1
         
         val_loss = val_loss / len(val_loader.dataset)
         val_acc = 100 * correct / total
         val_losses.append(val_loss)
         val_accs.append(val_acc)
+        
+        # Per-class accuracy logging
+        logger.info("Per-class validation accuracy:")
+        for i, class_name in enumerate(class_names):
+            if class_total[i] > 0:
+                class_acc = 100 * class_correct[i] / class_total[i]
+                logger.info(f"{class_name}: {class_acc:.2f}%")
+            else:
+                logger.info(f"{class_name}: No samples")
         
         logger.info(f"Epoch {epoch+1}/{num_epochs} - {model_name}")
         logger.info(f"Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.2f}%")
@@ -297,6 +321,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             best_val_acc = val_acc
             torch.save(model.state_dict(), best_model_path)
             logger.info(f"Saved best model with Val Acc: {best_val_acc:.2f}%")
+        
+        # Step the scheduler
+        scheduler.step(val_loss)
     
     return train_losses, val_losses, train_accs, val_accs, best_val_acc
 
@@ -360,7 +387,7 @@ def evaluate_model(model, test_loader, criterion, device, class_names, model_nam
 def efficiency_analysis(model, input_size=(3, 299, 299), device='cuda', model_name="HVT"):
     model.eval()
     dummy_input = torch.randn(1, *input_size).to(device)
-    spectral_input = torch.randn(1, 299, 299).to(device) if has_multimodal else None
+    spectral_input = torch.randn(1, 1, 299, 299).to(device) if has_multimodal else None
     
     # Model size
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad) * 4 / (1024 ** 2)  # MB
@@ -430,18 +457,15 @@ def visualize_attention(model, dataloader, class_names, device, num_samples=5, s
 
 # Main Execution
 if __name__ == "__main__":
-    # Step 1: Train Inception V3
-    inception_model = get_inception_v3_model(num_classes)
+    # Step 1: Load existing Inception V3 results (no re-training)
+    inception_checkpoint = "./phase2_checkpoints/InceptionV3_best.pth"
+    if not os.path.exists(inception_checkpoint):
+        logger.error(f"Inception V3 checkpoint not found at {inception_checkpoint}")
+        raise FileNotFoundError(f"Inception V3 checkpoint not found at {inception_checkpoint}")
+    
+    inception_model = get_inception_v3_model(num_classes, weights=None)
+    inception_model.load_state_dict(torch.load(inception_checkpoint))
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.Adam(inception_model.parameters(), lr=0.001)
-    
-    logger.info("Training Inception V3...")
-    train_losses, val_losses, train_accs, val_accs, best_val_acc = train_model(
-        inception_model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device=device, model_name="InceptionV3"
-    )
-    
-    # Evaluate Inception V3 on test set
-    inception_model.load_state_dict(torch.load("./phase2_checkpoints/InceptionV3_best.pth"))
     test_acc, report, cm = evaluate_model(inception_model, test_loader, criterion, device, class_names, model_name="InceptionV3")
     inception_model_size, inception_inference_time = efficiency_analysis(inception_model, device=device, model_name="InceptionV3")
     
@@ -453,11 +477,12 @@ if __name__ == "__main__":
     
     # Preliminary training to validate architecture
     criterion_hvt = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer_hvt = optim.Adam(hvt_model.parameters(), lr=0.0001)
+    optimizer_hvt = optim.Adam(hvt_model.parameters(), lr=0.001)  # Increased learning rate
+    scheduler_hvt = optim.lr_scheduler.ReduceLROnPlateau(optimizer_hvt, mode='min', factor=0.1, patience=3, verbose=True)
     
-    logger.info("Validating HVT architecture with preliminary training...")
+    logger.info("Continuing HVT architecture training...")
     hvt_train_losses, hvt_val_losses, hvt_train_accs, hvt_val_accs, hvt_best_val_acc = train_model(
-        hvt_model, train_loader, val_loader, criterion_hvt, optimizer_hvt, num_epochs=20, device=device, model_name="HVT"
+        hvt_model, train_loader, val_loader, criterion_hvt, optimizer_hvt, scheduler_hvt, num_epochs=20, device=device, model_name="HVT"
     )
     
     # Evaluate HVT on test set
@@ -471,11 +496,6 @@ if __name__ == "__main__":
     # Step 4: Save Results
     phase2_results = {
         'inception': {
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accs': train_accs,
-            'val_accs': val_accs,
-            'best_val_acc': best_val_acc,
             'test_acc': test_acc,
             'report': report,
             'confusion_matrix': cm,
@@ -497,4 +517,4 @@ if __name__ == "__main__":
     }
     torch.save(phase2_results, "./phase2_checkpoints/phase2_results.pth")
     
-    logger.info("Phase 2 completed: HVT architecture designed and validated.")
+    logger.info("Phase 2 completed: HVT architecture training continued with existing Inception V3 data.")
