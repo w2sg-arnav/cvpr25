@@ -326,7 +326,7 @@ train_normalization = transforms.Compose([
 ])
 
 val_test_transform = transforms.Compose([
-    transforms.ToTensor(),  # Convert to float32 [0, 1] if not already
+    transforms.Lambda(lambda x: x if isinstance(x, torch.Tensor) else transforms.ToTensor()(x)),  # Handle tensor or convert if needed
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
