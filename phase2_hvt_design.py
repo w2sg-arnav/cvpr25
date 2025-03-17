@@ -13,6 +13,7 @@ import logging
 import time
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -68,9 +69,9 @@ def get_inception_v3_model(num_classes, weights=Inception_V3_Weights.IMAGENET1K_
     
     return model.to(device)
 
-# Hierarchical Vision Transformer (HVT) Design
+# Hierarchical Vision Transformer (HVT) Design with Optimized Parameters
 class MultiScalePatchEmbed(nn.Module):
-    def __init__(self, img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=768):
+    def __init__(self, img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=384):
         super().__init__()
         self.patch_sizes = patch_sizes
         self.num_patches = []
@@ -92,13 +93,14 @@ class MultiScalePatchEmbed(nn.Module):
         return multi_scale_features
 
 class CrossAttentionFusion(nn.Module):
-    def __init__(self, embed_dim, num_heads=8):
+    def __init__(self, embed_dim, num_heads=6):
         super().__init__()
         self.cross_attention = nn.MultiheadAttention(embed_dim, num_heads)
         self.norm = nn.LayerNorm(embed_dim)
     
     def forward(self, rgb_features, spectral_features):
         if spectral_features is None:
+            logger.info("No spectral data available; skipping cross-attention fusion.")
             return rgb_features
         fused, _ = self.cross_attention(rgb_features, spectral_features, spectral_features)
         return self.norm(fused + rgb_features)
@@ -119,15 +121,15 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
-        attn_output, _ = self.attention(x, x, x)
+        attn_output, attn_weights = self.attention(x, x, x)
         x = self.norm1(x + self.dropout(attn_output))
         mlp_output = self.mlp(x)
         x = self.norm2(x + self.dropout(mlp_output))
-        return x
+        return x, attn_weights
 
 class HierarchicalVisionTransformer(nn.Module):
-    def __init__(self, img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=768, 
-                 num_heads=12, depth=16, num_classes=7, dropout=0.1):
+    def __init__(self, img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=384, 
+                 num_heads=6, depth=8, num_classes=8, dropout=0.1):
         super().__init__()
         self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, in_chans, embed_dim)
         self.num_patches = self.patch_embed.num_patches
@@ -136,10 +138,10 @@ class HierarchicalVisionTransformer(nn.Module):
         
         # Separate CLS token and positional embeddings for each scale
         self.cls_tokens = nn.Parameter(torch.zeros(len(patch_sizes), 1, embed_dim))
-        self.pos_embeds = [
+        self.pos_embeds = nn.ParameterList([
             nn.Parameter(torch.zeros(1, num_patch + 1, embed_dim))
             for num_patch in self.num_patches
-        ]
+        ])
         self.dropout = nn.Dropout(dropout)
         
         self.spectral_embed = nn.Linear(1, embed_dim) if has_multimodal else None
@@ -178,25 +180,24 @@ class HierarchicalVisionTransformer(nn.Module):
                 features = self.cross_attention(features, spectral_features)
             
             for layer in self.transformer_layers:
-                features = layer(features)
+                features, _ = layer(features)
             
             features = self.norm(features)
             cls_output = features[:, 0]  # Extract CLS token
-            scale_outputs.append(cls_output)  # Should be [B, embed_dim]
+            scale_outputs.append(cls_output)
         
-        # Concatenate scale outputs along the feature dimension
-        combined_features = torch.cat(scale_outputs, dim=-1)  # Should be [B, embed_dim * len(patch_sizes)]
+        combined_features = torch.cat(scale_outputs, dim=-1)
         fused_features = self.fusion_head(combined_features)
         logits = self.head(fused_features)
         return logits
 
     def get_attention_weights(self, rgb, spectral=None):
         self.eval()
+        attention_weights_all_scales = []
         with torch.no_grad():
             B = rgb.shape[0]
             multi_scale_features = self.patch_embed(rgb)
             
-            attention_weights = []
             for i, (features, pos_embed) in enumerate(zip(multi_scale_features, self.pos_embeds)):
                 cls_tokens = self.cls_tokens[i].expand(B, -1, -1)
                 features = torch.cat((cls_tokens, features), dim=1)
@@ -209,17 +210,17 @@ class HierarchicalVisionTransformer(nn.Module):
                     spectral_features = spectral_features.expand(-1, features.shape[1], -1)
                     features = self.cross_attention(features, spectral_features)
                 
+                attention_weights = []
                 for layer in self.transformer_layers:
-                    attn_output, attn_weight = layer.attention(features, features, features)
+                    features, attn_weight = layer(features)
                     attention_weights.append(attn_weight)
-                    features = layer.norm1(features + layer.dropout(attn_output))
-                    mlp_output = layer.mlp(features)
-                    features = layer.norm2(features + layer.dropout(mlp_output))
+                
+                attention_weights_all_scales.append(attention_weights)
             
-            return attention_weights
+            return attention_weights_all_scales
 
-# Training Function
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, model_name="HVT"):
+# Training Function with Learning Rate Scheduling
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, scheduler=None, model_name="HVT"):
     scaler = GradScaler()
     best_val_acc = 0.0
     best_model_path = f"./phase2_checkpoints/{model_name}_best.pth"
@@ -297,7 +298,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             best_val_acc = val_acc
             torch.save(model.state_dict(), best_model_path)
             logger.info(f"Saved best model with Val Acc: {best_val_acc:.2f}%")
-    
+        
+        # Step the scheduler if provided
+        if scheduler is not None:
+            if isinstance(scheduler, ReduceLROnPlateau):
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+
     return train_losses, val_losses, train_accs, val_accs, best_val_acc
 
 # Evaluation Function
@@ -356,33 +364,38 @@ def evaluate_model(model, test_loader, criterion, device, class_names, model_nam
     
     return test_acc, report, cm
 
-# Efficiency Analysis
+# Efficiency Analysis with Multiple Batch Sizes
 def efficiency_analysis(model, input_size=(3, 299, 299), device='cuda', model_name="HVT"):
     model.eval()
-    dummy_input = torch.randn(1, *input_size).to(device)
-    spectral_input = torch.randn(1, 299, 299).to(device) if has_multimodal else None
+    batch_sizes = [1, 32]
+    efficiency_metrics = {}
     
-    # Model size
-    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad) * 4 / (1024 ** 2)  # MB
+    for batch_size in batch_sizes:
+        dummy_input = torch.randn(batch_size, *input_size).to(device)
+        spectral_input = torch.randn(batch_size, 299, 299).to(device) if has_multimodal else None
+        
+        # Model size
+        model_size = sum(p.numel() for p in model.parameters() if p.requires_grad) * 4 / (1024 ** 2)  # MB
+        
+        # Inference time
+        num_trials = 100
+        start_time = time.time()
+        with torch.no_grad():
+            for _ in range(num_trials):
+                if isinstance(model, HierarchicalVisionTransformer):
+                    _ = model(dummy_input, spectral_input)
+                else:
+                    _ = model(dummy_input)
+        avg_time = (time.time() - start_time) / num_trials * 1000  # ms
+        
+        efficiency_metrics[batch_size] = {'model_size': model_size, 'inference_time': avg_time}
+        logger.info(f"\n{model_name} Efficiency Analysis (Batch Size {batch_size}):")
+        logger.info(f"Model Size: {model_size:.2f} MB")
+        logger.info(f"Average Inference Time ({device}): {avg_time:.2f} ms/sample")
     
-    # Inference time
-    num_trials = 100
-    start_time = time.time()
-    with torch.no_grad():
-        for _ in range(num_trials):
-            if isinstance(model, HierarchicalVisionTransformer):
-                _ = model(dummy_input, spectral_input)
-            else:
-                _ = model(dummy_input)
-    avg_time = (time.time() - start_time) / num_trials * 1000  # ms
-    
-    logger.info(f"\n{model_name} Efficiency Analysis:")
-    logger.info(f"Model Size: {model_size:.2f} MB")
-    logger.info(f"Average Inference Time ({device}): {avg_time:.2f} ms/sample")
-    
-    return model_size, avg_time
+    return efficiency_metrics
 
-# Visualize Attention for HVT
+# Visualize Attention for HVT with Correct Patch Grid Reshaping
 def visualize_attention(model, dataloader, class_names, device, num_samples=5, save_path="./phase2_checkpoints"):
     model.eval()
     batch = next(iter(dataloader))
@@ -390,80 +403,89 @@ def visualize_attention(model, dataloader, class_names, device, num_samples=5, s
     spectral = batch[1][:num_samples].to(device) if has_multimodal else None
     labels = batch[2][:num_samples].numpy()
     
-    attention_weights = model.get_attention_weights(images, spectral)
+    attention_weights_all_scales = model.get_attention_weights(images, spectral)
     
-    # Aggregate attention across layers and heads
-    avg_attention = torch.stack(attention_weights).mean(dim=0)  # Average across layers
-    avg_attention = avg_attention.mean(dim=1)  # Average across heads
-    
-    # Visualize for each sample
+    # Visualize for each scale (patch size)
     os.makedirs(save_path, exist_ok=True)
-    for i in range(num_samples):
-        attn_map = avg_attention[i, 1:]  # Exclude cls token
-        attn_map = attn_map.view(int(np.sqrt(attn_map.shape[0])), -1)
-        attn_map = F.interpolate(
-            attn_map.unsqueeze(0).unsqueeze(0), 
-            size=(299, 299), 
-            mode='bilinear', 
-            align_corners=False
-        ).squeeze()
+    for scale_idx, (patch_size, attention_weights) in enumerate(zip([16, 32], attention_weights_all_scales)):
+        # Aggregate attention across layers and heads
+        avg_attention = torch.stack(attention_weights).mean(dim=0)  # Average across layers
+        avg_attention = avg_attention.mean(dim=1)  # Average across heads
         
-        plt.figure(figsize=(10, 5))
+        # Number of patches for this scale
+        num_patches_per_side = 299 // patch_size
+        num_patches = num_patches_per_side ** 2
         
-        # Original Image
-        plt.subplot(1, 2, 1)
-        img = images[i].cpu() * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        plt.imshow(img.permute(1, 2, 0).numpy())
-        plt.title(f"Class: {class_names[labels[i]]}")
-        plt.axis('off')
-        
-        # Attention Heatmap
-        plt.subplot(1, 2, 2)
-        plt.imshow(img.permute(1, 2, 0).numpy())
-        plt.imshow(attn_map.cpu().numpy(), cmap='jet', alpha=0.5)
-        plt.title("Attention Heatmap")
-        plt.axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_path, f"hvt_attention_sample_{i}.png"))
-        plt.close()
+        # Visualize for each sample
+        for i in range(num_samples):
+            attn_map = avg_attention[i, 1:num_patches+1]  # Exclude CLS token
+            attn_map = attn_map.view(num_patches_per_side, num_patches_per_side)
+            attn_map = F.interpolate(
+                attn_map.unsqueeze(0).unsqueeze(0),
+                size=(299, 299),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze()
+            
+            plt.figure(figsize=(10, 5))
+            
+            # Original Image
+            plt.subplot(1, 2, 1)
+            img = images[i].cpu() * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            plt.imshow(img.permute(1, 2, 0).numpy())
+            plt.title(f"Class: {class_names[labels[i]]}")
+            plt.axis('off')
+            
+            # Attention Heatmap
+            plt.subplot(1, 2, 2)
+            plt.imshow(img.permute(1, 2, 0).numpy())
+            plt.imshow(attn_map.cpu().numpy(), cmap='jet', alpha=0.5)
+            plt.title(f"Attention Heatmap (Patch Size {patch_size})")
+            plt.axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_path, f"hvt_attention_sample_{i}_scale_{patch_size}.png"))
+            plt.close()
 
 # Main Execution
 if __name__ == "__main__":
-    # Step 1: Train Inception V3
+    # Step 1: Train Inception V3 with Learning Rate Scheduling
     inception_model = get_inception_v3_model(num_classes)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(inception_model.parameters(), lr=0.001)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
     
     logger.info("Training Inception V3...")
     train_losses, val_losses, train_accs, val_accs, best_val_acc = train_model(
-        inception_model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device=device, model_name="InceptionV3"
+        inception_model, train_loader, val_loader, criterion, optimizer, num_epochs=20, 
+        device=device, scheduler=scheduler, model_name="InceptionV3"
     )
     
     # Evaluate Inception V3 on test set
     inception_model.load_state_dict(torch.load("./phase2_checkpoints/InceptionV3_best.pth"))
     test_acc, report, cm = evaluate_model(inception_model, test_loader, criterion, device, class_names, model_name="InceptionV3")
-    inception_model_size, inception_inference_time = efficiency_analysis(inception_model, device=device, model_name="InceptionV3")
+    inception_metrics = efficiency_analysis(inception_model, device=device, model_name="InceptionV3")
     
-    # Step 2: Initialize and Validate HVT
+    # Step 2: Initialize and Train HVT with Warmup Scheduler
     hvt_model = HierarchicalVisionTransformer(
-        img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=768, 
-        num_heads=12, depth=16, num_classes=num_classes, dropout=0.1
+        img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=384,
+        num_heads=6, depth=8, num_classes=num_classes, dropout=0.1
     ).to(device)
     
-    # Preliminary training to validate architecture
     criterion_hvt = nn.CrossEntropyLoss(weight=class_weights)
     optimizer_hvt = optim.Adam(hvt_model.parameters(), lr=0.0001)
+    scheduler_hvt = LambdaLR(optimizer_hvt, lr_lambda=lambda epoch: min(1.0, (epoch + 1) / 5.0))
     
-    logger.info("Validating HVT architecture with preliminary training...")
+    logger.info("Training HVT architecture...")
     hvt_train_losses, hvt_val_losses, hvt_train_accs, hvt_val_accs, hvt_best_val_acc = train_model(
-        hvt_model, train_loader, val_loader, criterion_hvt, optimizer_hvt, num_epochs=20, device=device, model_name="HVT"
+        hvt_model, train_loader, val_loader, criterion_hvt, optimizer_hvt, num_epochs=20,
+        device=device, scheduler=scheduler_hvt, model_name="HVT"
     )
     
     # Evaluate HVT on test set
     hvt_model.load_state_dict(torch.load("./phase2_checkpoints/HVT_best.pth"))
     hvt_test_acc, hvt_report, hvt_cm = evaluate_model(hvt_model, test_loader, criterion_hvt, device, class_names, model_name="HVT")
-    hvt_model_size, hvt_inference_time = efficiency_analysis(hvt_model, device=device, model_name="HVT")
+    hvt_metrics = efficiency_analysis(hvt_model, device=device, model_name="HVT")
     
     # Step 3: Visualize HVT Attention
     visualize_attention(hvt_model, test_loader, class_names, device, num_samples=5, save_path="./phase2_checkpoints")
@@ -479,8 +501,7 @@ if __name__ == "__main__":
             'test_acc': test_acc,
             'report': report,
             'confusion_matrix': cm,
-            'model_size': inception_model_size,
-            'inference_time': inception_inference_time
+            'efficiency_metrics': inception_metrics
         },
         'hvt': {
             'train_losses': hvt_train_losses,
@@ -491,10 +512,9 @@ if __name__ == "__main__":
             'test_acc': hvt_test_acc,
             'report': hvt_report,
             'confusion_matrix': hvt_cm,
-            'model_size': hvt_model_size,
-            'inference_time': hvt_inference_time
+            'efficiency_metrics': hvt_metrics
         }
     }
     torch.save(phase2_results, "./phase2_checkpoints/phase2_results.pth")
     
-    logger.info("Phase 2 completed: HVT architecture designed and validated.")
+    logger.info("Phase 2 completed: HVT architecture trained and evaluated.")
