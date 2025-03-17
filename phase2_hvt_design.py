@@ -457,7 +457,7 @@ if __name__ == "__main__":
     
     logger.info("Training Inception V3...")
     train_losses, val_losses, train_accs, val_accs, best_val_acc = train_model(
-        inception_model, train_loader, val_loader, criterion, optimizer, num_epochs=20, 
+        inception_model, train_loader, val_loader, criterion, optimizer, num_epochs=10, 
         device=device, scheduler=scheduler, model_name="InceptionV3"
     )
     
