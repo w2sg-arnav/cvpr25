@@ -43,6 +43,15 @@ class SSLCottonLeafDataset(Dataset):
             'advanced': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.5), 1.5)
         }
 
+        # Enhanced augmentation for regularization
+        self.augmentation = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=30),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.RandomResizedCrop(size=(299, 299), scale=(0.8, 1.0)),
+        ])
+
     def __len__(self):
         return len(self.samples)
 
@@ -64,6 +73,9 @@ class SSLCottonLeafDataset(Dataset):
                 img = transforms.Resize((299, 299))(img)
                 if img.shape[0] != 3:
                     img = img[:3, :, :]  # Ensure 3 channels
+
+            # Apply additional augmentations
+            img = self.augmentation(img)
 
             # Apply transforms if not already applied
             if self.transform:
@@ -116,8 +128,12 @@ class SSLHierarchicalVisionTransformer(nn.Module):
         super().__init__()
         self.base_model = base_model
         
-        for param in self.base_model.parameters():
-            param.requires_grad = False
+        # Unfreeze the last few layers of the HVT base model for fine-tuning
+        for name, param in self.base_model.named_parameters():
+            if "transformer_layers.12" in name or "transformer_layers.13" in name or "transformer_layers.14" in name or "transformer_layers.15" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
         
         with torch.no_grad():
             test_input = torch.randn(1, 3, 299, 299).to(device)
@@ -128,17 +144,32 @@ class SSLHierarchicalVisionTransformer(nn.Module):
             self.feature_dim = test_output.size(-1)
             logger.info(f"Detected feature dimension: {self.feature_dim}")
         
+        # If feature dimension is too small, project it to a higher dimension
+        if self.feature_dim < 128:
+            self.feature_projection = nn.Linear(self.feature_dim, 768)  # Project to 768 dimensions
+            self.feature_dim = 768
+            logger.info(f"Projected feature dimension to: {self.feature_dim}")
+        
+        # Deeper projection head with dropout for regularization
         self.projection_head = nn.Sequential(
             nn.Linear(self.feature_dim, 1024),
             nn.ReLU(),
-            nn.Linear(1024, 256)
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256)
         )
         
         if hasattr(base_model, 'has_multimodal') and base_model.has_multimodal:
             self.spectral_projection = nn.Sequential(
                 nn.Linear(299*299, 1024),
                 nn.ReLU(),
-                nn.Linear(1024, 256)
+                nn.Dropout(0.3),
+                nn.Linear(1024, 512),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(512, 256)
             )
         
         self.progression_head = nn.Linear(256, num_classes)
@@ -147,13 +178,16 @@ class SSLHierarchicalVisionTransformer(nn.Module):
         if mask is not None:
             rgb = rgb * mask
         
-        with torch.no_grad():
-            features = self.base_model(rgb, spectral)
+        features = self.base_model(rgb, spectral)
         
         if features.dim() == 3:
             features = features[:, 0, :]
         elif features.dim() != 2:
             raise ValueError(f"Unexpected feature shape: {features.shape}")
+        
+        # Project features if necessary
+        if hasattr(self, 'feature_projection'):
+            features = self.feature_projection(features)
             
         projection = self.projection_head(features)
         progression_logits = self.progression_head(projection)
@@ -184,12 +218,36 @@ class InfoNCECrossModalLoss(nn.Module):
         loss = self.criterion(similarity_matrix, labels)
         return loss
 
+class LinearWarmupCosineAnnealingLR(optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_epochs, max_epochs, warmup_start_lr, eta_min=0, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.warmup_start_lr = warmup_start_lr
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            # Linear warmup
+            lr = self.warmup_start_lr + (self.base_lrs[0] - self.warmup_start_lr) * self.last_epoch / self.warmup_epochs
+        else:
+            # Cosine annealing
+            progress = (self.last_epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            lr = self.eta_min + (self.base_lrs[0] - self.eta_min) * cosine_decay
+        return [lr for _ in self.base_lrs]
+
 def train_ssl_model(model, train_loader, val_loader, criterion_progression, criterion_contrastive,
-                    optimizer, num_epochs, device, train_mean, train_std, mask_ratio_start=0.3, mask_ratio_end=0.6):
+                    optimizer, scheduler, num_epochs, device, train_mean, train_std, mask_ratio_start=0.3, mask_ratio_end=0.6):
     scaler = GradScaler()
     best_val_loss = float('inf')
     best_model_path = "./phase3_checkpoints/ssl_hvt_best.pth"
     os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
+
+    # Early stopping parameters
+    patience = 5  # Reduced patience for 10 epochs
+    epochs_no_improve = 0
+    early_stop = False
 
     for epoch in range(num_epochs):
         model.train()
@@ -212,12 +270,13 @@ def train_ssl_model(model, train_loader, val_loader, criterion_progression, crit
                 masked_proj_features, _ = model(masked_images, spectral, mask)
 
                 prog_loss = criterion_progression(prog_logits, stage)
-                spectral_embed = model.get_spectral_embedding(spectral)
-                contrastive_loss = criterion_contrastive(proj_features, spectral_embed)
-
-                total_loss = prog_loss + 0.7 * contrastive_loss
+                # Removed contrastive loss to focus on progression task
+                total_loss = prog_loss
 
             scaler.scale(total_loss).backward()
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -245,19 +304,37 @@ def train_ssl_model(model, train_loader, val_loader, criterion_progression, crit
                 masked_proj_features, _ = model(masked_images, spectral)
 
                 prog_loss = criterion_progression(prog_logits, stage)
-                spectral_embed = model.get_spectral_embedding(spectral)
-                contrastive_loss = criterion_contrastive(proj_features, spectral_embed)
-
-                total_loss = prog_loss + 0.7 * contrastive_loss
+                total_loss = prog_loss
                 val_loss += total_loss.item() * images.size(0)
 
         val_loss = val_loss / len(val_loader.dataset)
         logger.info(f"Validation Loss: {val_loss:.4f}")
 
+        # Save best model and implement early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), best_model_path)
             logger.info(f"Saved best model with Val Loss: {best_val_loss:.4f}")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                logger.info(f"Early stopping triggered after {epoch+1} epochs")
+                early_stop = True
+                break
+
+        # Save periodic checkpoints
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = f"./phase3_checkpoints/ssl_hvt_epoch_{epoch+1}.pth"
+            torch.save(model.state_dict(), checkpoint_path)
+            logger.info(f"Saved checkpoint at epoch {epoch+1} to {checkpoint_path}")
+
+        # Step the learning rate scheduler
+        scheduler.step()
+        logger.info(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
+
+        if early_stop:
+            break
 
     return best_model_path
 
@@ -330,26 +407,33 @@ if __name__ == "__main__":
         logger.info("SSL datasets prepared")
 
         # Step 4: Create DataLoaders
-        ssl_train_loader = DataLoader(ssl_train_dataset, batch_size=64, shuffle=True, num_workers=8, pin_memory=True)
-        ssl_val_loader = DataLoader(ssl_val_dataset, batch_size=64, shuffle=False, num_workers=8, pin_memory=True)
+        ssl_train_loader = DataLoader(ssl_train_dataset, batch_size=128, shuffle=True, num_workers=8, pin_memory=True)
+        ssl_val_loader = DataLoader(ssl_val_dataset, batch_size=128, shuffle=False, num_workers=8, pin_memory=True)
         logger.info("DataLoaders created")
 
         # Step 5: Initialize SSL Model
         ssl_model = SSLHierarchicalVisionTransformer(hvt_model, num_classes=3).to(device)
         logger.info("SSL model initialized")
 
-        # Step 6: Define Loss Functions and Optimizer
+        # Step 6: Define Loss Functions, Optimizer, and Scheduler
         criterion_progression = nn.CrossEntropyLoss()
         criterion_contrastive = InfoNCECrossModalLoss(temperature=0.07)
-        optimizer = optim.AdamW(ssl_model.parameters(), lr=3e-4, weight_decay=0.01)
-        logger.info("Optimizer and loss functions initialized")
+        optimizer = optim.AdamW(ssl_model.parameters(), lr=3e-5, weight_decay=0.1)
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_epochs=5,
+            max_epochs=10,  # Adjusted for 10 epochs
+            warmup_start_lr=1e-5,
+            eta_min=1e-6
+        )
+        logger.info("Optimizer, loss functions, and scheduler initialized")
 
         # Step 7: Train SSL Model
         logger.info("Starting Self-Supervised Pretraining...")
         best_model_path = train_ssl_model(
             ssl_model, ssl_train_loader, ssl_val_loader, 
             criterion_progression, criterion_contrastive,
-            optimizer, num_epochs=50, device=device,  # Increased to 50 epochs
+            optimizer, scheduler, num_epochs=10, device=device,  # Reduced to 10 epochs
             train_mean=train_mean, train_std=train_std
         )
 
