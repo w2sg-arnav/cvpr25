@@ -51,9 +51,16 @@ has_multimodal = checkpoint_data['has_multimodal']
 class_distribution = checkpoint_data['original_stats']['class_distribution']
 SPECTRAL_DIR = checkpoint_data['spectral_dir'] # check if there is any spectral data available or not
 
+# Load normalization parameters from training set:
+train_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+train_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+
+logger.info(f"Train Mean: {train_mean.tolist()}")
+logger.info(f"Train Std: {train_std.tolist()}")
+
 # Create DataLoaders
-batch_size = 64 # Increased Batch size. You can try increasing it more.
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+batch_size = 64  # Increased Batch size. You can try increasing it more.
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)  # Drop last for consistent batch size
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
@@ -79,20 +86,6 @@ def get_inception_v3_model(num_classes, weights=Inception_V3_Weights.IMAGENET1K_
 # Training Function with Learning Rate Scheduling
 def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer, num_epochs: int, device: torch.device, scheduler: Optional[ReduceLROnPlateau] = None, model_name: str = "HVT") -> Tuple[list, list, list, list, float]:
     """Trains the model and validates periodically.
-
-    Args:
-        model (nn.Module): Model to train.
-        train_loader (DataLoader): Training data loader.
-        val_loader (DataLoader): Validation data loader.
-        criterion (nn.Module): Loss function.
-        optimizer (optim.Optimizer): Optimizer.
-        num_epochs (int): Number of epochs.
-        device (torch.device): Device to use (CPU or GPU).
-        scheduler (ReduceLROnPlateau, optional): Learning rate scheduler. Defaults to None.
-        model_name (str, optional): Model name for saving checkpoints. Defaults to "HVT".
-
-    Returns:
-        Tuple[list, list, list, list, float]: Train losses, validation losses, train accuracies, validation accuracies, and best validation accuracy.
     """
     scaler = GradScaler() # Define scaler
     best_val_acc = 0.0
@@ -101,6 +94,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
 
     train_losses, val_losses, train_accs, val_accs = [], [], [], []
     accumulation_steps = 2  # You could further reduce if it runs out of memory
+    dropout_value = 0.3;
 
     for epoch in range(num_epochs):
         model.train()
@@ -113,6 +107,12 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
             inputs = inputs.to(device)
             labels = labels.to(device)
             spectral = spectral.to(device) if has_multimodal and SPECTRAL_DIR else None  # Only move to device if spectral data exists
+            
+            # Inspect data range and type
+            logger.info(f"Batch: {i+1}/{len(train_loader)}")
+            logger.info(f"Input range: min={inputs.min():.4f}, max={inputs.max():.4f}, type={inputs.dtype}")
+            if spectral is not None:
+                logger.info(f"Spectral range: min={spectral.min():.4f}, max={spectral.max():.4f}, type={spectral.dtype}")
 
             with autocast():  # Enable mixed precision
                 if isinstance(model, HierarchicalVisionTransformer):
@@ -123,6 +123,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
             loss = loss / accumulation_steps # Scale the loss
 
             scaler.scale(loss).backward() # Scale the gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients
 
             if (i + 1) % accumulation_steps == 0:  # Accumulate gradients
                 scaler.step(optimizer)  # Update weights
@@ -147,6 +148,10 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         with torch.no_grad(), autocast():  # Enable mixed precision
             for inputs, spectral, labels in val_loader:
                 inputs = inputs.to(device)
+                # Check if it has been through normalization, if not normalize
+                if inputs.min() >= 0 and inputs.max() <= 1:
+                    inputs = (inputs - train_mean) / train_std
+                    logger.info("Corrected the normalization of the testing parameters.")
                 labels = labels.to(device)
                 spectral = spectral.to(device) if has_multimodal and SPECTRAL_DIR else None
 
@@ -181,6 +186,10 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
                 scheduler.step(val_loss)
             else:
                 scheduler.step()
+        
+        # Log the current learning rate
+        for param_group in optimizer.param_groups:
+            logger.info(f"Current Learning Rate: {param_group['lr']:.6f}")
 
     return train_losses, val_losses, train_accs, val_accs, best_val_acc
 
@@ -194,10 +203,16 @@ def evaluate_model(model: nn.Module, test_loader: DataLoader, criterion: nn.Modu
     total = 0
     all_preds = []
     all_labels = []
+    
+    rgb_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+    rgb_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
     with torch.no_grad(), autocast():  # Use mixed precision for inference
         for inputs, spectral, labels in test_loader:
             inputs = inputs.to(device)
+            # Check if it has been through normalization, if not normalize
+            if inputs.min() >= 0 and inputs.max() <= 1:
+                inputs = (inputs - rgb_mean) / rgb_std
             labels = labels.to(device)
             spectral = spectral.to(device) if has_multimodal and SPECTRAL_DIR else None  # Only move to device if spectral data exists
 
@@ -285,7 +300,8 @@ if __name__ == "__main__":
             embed_dims=[768, 384, 192],
             num_heads=24,
             num_layers=16,
-        has_multimodal=has_multimodal,  # set the has_multimodal flag here for if we want spectral analysis
+            has_multimodal=has_multimodal,  # set the has_multimodal flag here for if we want spectral analysis
+            dropout=0.4 #Adding dropout for some regularization
         ).to(device)
         
         # Inception model implementation
@@ -293,12 +309,12 @@ if __name__ == "__main__":
 
         # Step 2: Define Loss Function, Optimizer, and Scheduler (HVT)
         criterion_hvt = nn.CrossEntropyLoss(weight=class_weights)
-        optimizer_hvt = optim.Adam(hvt_model.parameters(), lr=0.0001)
+        optimizer_hvt = optim.Adam(hvt_model.parameters(), lr=0.0001, weight_decay=1e-5) #Adding weight decay
         scheduler_hvt = ReduceLROnPlateau(optimizer_hvt, mode='min', factor=0.1, patience=5)
 
         logger.info("Training HVT architecture...")
         hvt_train_losses, hvt_val_losses, hvt_train_accs, hvt_val_accs, hvt_best_val_acc = train_model(
-            hvt_model, train_loader, val_loader, criterion_hvt, optimizer_hvt, num_epochs=10,
+            hvt_model, train_loader, val_loader, criterion_hvt, optimizer_hvt, num_epochs=50,
             device=device, scheduler=scheduler_hvt, model_name="HVT"
         )
 

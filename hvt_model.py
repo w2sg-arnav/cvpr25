@@ -97,7 +97,7 @@ class TransformerEncoderLayerWithResidual(nn.Module):
         return src
 
 class HierarchicalVisionTransformer(nn.Module):
-    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [768, 384, 192], num_heads: int = 24, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299):
+    def __init__(self, num_classes: int, img_size: int = 299, patch_sizes: list = [16, 8, 4], embed_dims: list = [768, 384, 192], num_heads: int = 24, num_layers: int = 16, has_multimodal: bool = False, spectral_dim: int = 299, dropout: float = 0.0):
         super().__init__()
         self.has_multimodal = has_multimodal
         self.patch_embed = MultiScalePatchEmbed(img_size, patch_sizes, embed_dims=embed_dims)
@@ -108,11 +108,12 @@ class HierarchicalVisionTransformer(nn.Module):
                 d_model=self.embed_dim_total, 
                 nhead=num_heads, 
                 dim_feedforward=self.embed_dim_total*4, 
-                dropout=0.4,
+                dropout=dropout, # Pass the new dropout variable
                 drop_path_rate=0.2
             ) for _ in range(num_layers)
         ])
         
+        self.dropout = nn.Dropout(dropout)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim_total))
         self.num_patches = (self.patch_embed.target_size ** 2)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, self.embed_dim_total))
@@ -140,6 +141,7 @@ class HierarchicalVisionTransformer(nn.Module):
         combined_features = torch.cat((cls_tokens, combined_features), dim=1)
         combined_features = combined_features + self.pos_embed[:, :combined_features.size(1), :]
         
+        combined_features = self.dropout(combined_features)
         for layer in self.transformer_layers:
             combined_features = layer(combined_features)
         
