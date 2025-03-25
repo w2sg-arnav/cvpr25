@@ -391,7 +391,7 @@ def run_phase1():
         'rare_classes': rare_classes,
         'original_stats': original_stats,
         'augmented_stats': augmented_stats,
-        'has_multimodal': has_multimodal,
+        'has_multimodal': has_multimodal,  # Store has_multimodal in checkpoint
         'metadata': {
             'version': '1.1',
             'transforms': {
@@ -404,6 +404,7 @@ def run_phase1():
     torch.save(checkpoint_data, os.path.join(SAVE_PATH_PHASE1, 'phase1_preprocessed_data.pth'))
 
     logger.info("Phase 1 completed: Dataset prepared with class-specific augmentations and multimodal integration.")
+    return has_multimodal  # Return has_multimodal for Phase 2
 
 # Multi-Scale Patch Embedding
 class MultiScalePatchEmbed(nn.Module):
@@ -484,7 +485,7 @@ class TransformerEncoderLayer(nn.Module):
 class HierarchicalVisionTransformer(nn.Module):
     """Hierarchical Vision Transformer for multi-scale disease detection."""
     def __init__(self, img_sizes=[128, 256, 299], patch_size=16, in_chans=3, embed_dim=256,
-                 num_heads=8, depth=8, num_classes=7, dropout=0.15, stochastic_depth_prob=0.2):
+                 num_heads=8, depth=8, num_classes=7, dropout=0.15, stochastic_depth_prob=0.2, has_multimodal=False):
         super().__init__()
         self.patch_embed = MultiScalePatchEmbed(img_sizes, patch_size, in_chans, embed_dim)
         self.num_patches = self.patch_embed.num_patches
@@ -583,7 +584,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         for batch in train_loader:
             inputs = batch[0].to(device)
             labels = batch[2].to(device)
-            spectral = batch[1].to(device) if has_multimodal else None
+            spectral = batch[1].to(device) if batch[1] is not None else None  # Handle None spectral data
 
             optimizer.zero_grad()
             with autocast():
@@ -611,7 +612,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             for batch in val_loader:
                 inputs = batch[0].to(device)
                 labels = batch[2].to(device)
-                spectral = batch[1].to(device) if has_multimodal else None
+                spectral = batch[1].to(device) if batch[1] is not None else None
                 with autocast():
                     outputs = model(inputs, spectral)
                     loss = criterion(outputs, labels)
@@ -657,7 +658,7 @@ def evaluate_model(model, test_loader, criterion, device, class_names, model_nam
         for batch in test_loader:
             inputs = batch[0].to(device)
             labels = batch[2].to(device)
-            spectral = batch[1].to(device) if has_multimodal else None
+            spectral = batch[1].to(device) if batch[1] is not None else None
 
             outputs_samples = []
             for _ in range(num_samples):
@@ -708,7 +709,7 @@ def efficiency_analysis(model, input_size=(3, 299, 299), device='cuda', model_na
 
     for batch_size in batch_sizes:
         dummy_input = torch.randn(batch_size, *input_size).to(device)
-        spectral_input = torch.randn(batch_size, 2, 299, 299).to(device) if has_multimodal else None
+        spectral_input = torch.randn(batch_size, 2, 299, 299).to(device) if model.spectral_patch_embeds[0] is not None else None
 
         model_size = sum(p.numel() for p in model.parameters() if p.requires_grad) * 4 / (1024 ** 2)
         num_trials = 100
@@ -731,7 +732,7 @@ def visualize_attention(model, dataloader, class_names, device, num_samples=5, s
     model.eval()
     batch = next(iter(dataloader))
     images = batch[0][:num_samples].to(device)
-    spectral = batch[1][:num_samples].to(device) if has_multimodal else None
+    spectral = batch[1][:num_samples].to(device) if batch[1] is not None else None
     labels = batch[2][:num_samples].numpy()
 
     attention_weights_all_scales = model.get_attention_weights(images, spectral)
@@ -764,7 +765,7 @@ def visualize_attention(model, dataloader, class_names, device, num_samples=5, s
             plt.close()
 
 # Phase 2 Execution
-def run_phase2():
+def run_phase2(has_multimodal):
     """Execute Phase 2: Baseline Replication with Inception V3 and HVT Development."""
     # Load Phase 1 data
     CHECKPOINT_PATH = os.path.join(SAVE_PATH_PHASE1, 'phase1_preprocessed_data.pth')
@@ -779,8 +780,8 @@ def run_phase2():
     test_robustness_dataset = checkpoint_data['test_robustness_dataset']
     class_names = checkpoint_data['class_names']
     num_classes = len(class_names)
-    has_multimodal = checkpoint_data['has_multimodal']
-    class_distribution = checkpoint_data['original_stats']['class_distribution']
+    # Use has_multimodal passed from Phase 1 or from checkpoint if available
+    has_multimodal = checkpoint_data.get('has_multimodal', has_multimodal)
 
     # Create DataLoaders
     train_loader = DataLoader(
@@ -814,6 +815,7 @@ def run_phase2():
     )
 
     # Compute class weights
+    class_distribution = checkpoint_data['original_stats']['class_distribution']
     class_counts = np.array([class_distribution[name][0] for name in class_names])
     class_weights = 1.0 / class_counts
     class_weights = class_weights / class_weights.sum() * len(class_counts)
@@ -855,7 +857,8 @@ def run_phase2():
         depth=8,
         num_classes=num_classes,
         dropout=0.15,
-        stochastic_depth_prob=0.2
+        stochastic_depth_prob=0.2,
+        has_multimodal=has_multimodal
     ).to(device)
 
     criterion_hvt = nn.CrossEntropyLoss(weight=class_weights)
@@ -910,5 +913,5 @@ def run_phase2():
     logger.info("Phase 2 completed: HVT architecture trained and evaluated.")
 
 if __name__ == "__main__":
-    run_phase1()
-    run_phase2()
+    has_multimodal = run_phase1()  # Run Phase 1 and get has_multimodal
+    run_phase2(has_multimodal)     # Pass has_multimodal to Phase 2
