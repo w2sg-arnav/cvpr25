@@ -12,6 +12,7 @@ import numpy as np
 import logging
 import time
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy import stats
@@ -118,6 +119,8 @@ class FinetuneCottonLeafDataset(Dataset):
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
             transforms.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.7, 1.0)),
             transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),  # Add blur
+            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1),  # Add noise
         ])
 
     def __len__(self):
@@ -408,21 +411,26 @@ def evaluate_model(model, test_loader, criterion, device, train_mean, train_std,
     return test_loss, accuracy, f1, cm, all_uncertainties
 
 def evaluate_baselines(test_loader, device, train_mean, train_std):
+    # Initialize ResNet-50
     resnet = models.resnet50(pretrained=True)
     resnet.fc = nn.Linear(resnet.fc.in_features, 3)
     resnet = resnet.to(device)
     resnet.eval()
 
+    # Initialize ViT
     vit = models.vit_b_16(pretrained=True)
     vit.heads = nn.Linear(vit.heads.head.in_features, 3)
     vit = vit.to(device)
     vit.eval()
 
+    # Define resize transform for ViT (224x224)
+    resize_to_224 = transforms.Resize((224, 224))
+
     criterion = nn.CrossEntropyLoss()
-    baselines = {"ResNet-50": resnet, "ViT": vit}
+    baselines = {"ResNet-50": (resnet, None), "ViT": (vit, resize_to_224)}
     results = {}
 
-    for name, model in baselines.items():
+    for name, (model, resize_transform) in baselines.items():
         test_loss = 0.0
         all_preds = []
         all_labels = []
@@ -434,6 +442,10 @@ def evaluate_baselines(test_loader, device, train_mean, train_std):
 
                 if images.min() >= 0 and images.max() <= 1:
                     images = (images - train_mean) / train_std
+
+                # Resize images if required by the model
+                if resize_transform is not None:
+                    images = resize_transform(images)
 
                 logits = model(images)
                 loss = criterion(logits, stage)
@@ -511,74 +523,89 @@ if __name__ == "__main__":
         logger.info(f"class_names: {class_names}")
 
         # Define mapping from original labels to stages
-        # Assuming class_names is something like ['healthy', 'early_disease', 'mid_disease', 'advanced_disease']
-        # and labels are 3, 4, 5, 6 respectively
         label_to_stage = {
-            3: 'healthy',  # Will be filtered out
-            4: 'early',
-            5: 'mid',
-            6: 'advanced'
+            0: 'early',       # 'Bacterial Blight' - early stage of bacterial disease
+            1: 'advanced',    # 'Curl Virus' - advanced stage of viral disease
+            2: 'healthy',     # 'Healthy Leaf' - to be filtered out
+            3: 'damage',      # 'Herbicide Growth Damage' - to be filtered out
+            4: 'early',       # 'Leaf Hopper Jassids' - early pest damage
+            5: 'mid',         # 'Leaf Redding' - mid-stage symptom
+            6: 'advanced'     # 'Leaf Variegation' - advanced symptom
         }
         logger.info(f"Label to stage mapping: {label_to_stage}")
 
-        # Convert datasets to lists of samples, filtering out 'healthy' samples
-        logger.info("Converting train_dataset to list of samples...")
-        train_samples = []
-        for idx in range(len(train_dataset)):
-            try:
-                sample = train_dataset[idx]
-                label = sample[2]  # Label is the third element in the tuple
-                if label_to_stage.get(label) == 'healthy':
-                    continue  # Skip 'healthy' samples
-                train_samples.append(sample)
-            except Exception as e:
-                logger.warning(f"Error accessing train_dataset[{idx}]: {e}")
-                continue
-        logger.info(f"Converted train_dataset to list with {len(train_samples)} samples after filtering")
+        # Valid stages for training (exclude 'healthy', 'damage')
+        valid_stages = {'early', 'mid', 'advanced'}
 
-        logger.info("Converting val_dataset to list of samples...")
-        val_samples = []
-        for idx in range(len(val_dataset)):
-            try:
-                sample = val_dataset[idx]
-                label = sample[2]
-                if label_to_stage.get(label) == 'healthy':
+        # Log label distribution before filtering
+        def log_label_distribution(dataset, dataset_name):
+            label_counts = {}
+            for idx in range(len(dataset)):
+                try:
+                    sample = dataset[idx]
+                    label = sample[2]  # Label is the third element in the tuple
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                except Exception as e:
+                    logger.warning(f"Error accessing {dataset_name}[{idx}]: {e}")
                     continue
-                val_samples.append(sample)
-            except Exception as e:
-                logger.warning(f"Error accessing val_dataset[{idx}]: {e}")
-                continue
-        logger.info(f"Converted val_dataset to list with {len(val_samples)} samples after filtering")
+            logger.info(f"Label distribution in {dataset_name} before filtering: {label_counts}")
 
-        logger.info("Converting test_dataset to list of samples...")
-        test_samples = []
-        for idx in range(len(test_dataset)):
-            try:
-                sample = test_dataset[idx]
-                label = sample[2]
-                if label_to_stage.get(label) == 'healthy':
+        log_label_distribution(train_dataset, "train_dataset")
+        log_label_distribution(val_dataset, "val_dataset")
+        log_label_distribution(test_dataset, "test_dataset")
+
+        # Combine all samples and re-split with stratification
+        logger.info("Combining all samples for stratified splitting...")
+        all_samples = []
+        all_stages = []
+        for dataset, name in [(train_dataset, "train_dataset"), (val_dataset, "val_dataset"), (test_dataset, "test_dataset")]:
+            for idx in range(len(dataset)):
+                try:
+                    sample = dataset[idx]
+                    label = sample[2]
+                    stage = label_to_stage.get(label)
+                    if stage is None:
+                        logger.warning(f"Label {label} at index {idx} in {name} not in label_to_stage mapping. Skipping.")
+                        continue
+                    if stage not in valid_stages:
+                        continue
+                    all_samples.append(sample)
+                    all_stages.append(stage)
+                except Exception as e:
+                    logger.warning(f"Error accessing {name}[{idx}]: {e}")
                     continue
-                test_samples.append(sample)
-            except Exception as e:
-                logger.warning(f"Error accessing test_dataset[{idx}]: {e}")
-                continue
-        logger.info(f"Converted test_dataset to list with {len(test_samples)} samples after filtering")
+        logger.info(f"Total valid samples after filtering: {len(all_samples)}")
 
-        # Additional debugging: inspect the first few and last few samples
-        logger.info("Inspecting first 5 samples of train_samples:")
-        for i in range(min(5, len(train_samples))):
-            try:
-                sample = train_samples[i]
-                logger.info(f"Sample {i} type: {type(sample)}, value: {sample}")
-            except Exception as e:
-                logger.warning(f"Error accessing train_samples[{i}]: {e}")
-        logger.info("Inspecting last 5 samples of train_samples:")
-        for i in range(max(0, len(train_samples) - 5), len(train_samples)):
-            try:
-                sample = train_samples[i]
-                logger.info(f"Sample {i} type: {type(sample)}, value: {sample}")
-            except Exception as e:
-                logger.warning(f"Error accessing train_samples[{i}]: {e}")
+        # Stratified split: 80% train, 10% val, 10% test
+        train_val_samples, test_samples, train_val_stages, test_stages = train_test_split(
+            all_samples, all_stages, test_size=0.1, stratify=all_stages, random_state=42
+        )
+        train_samples, val_samples, train_val_stages, val_stages = train_test_split(
+            train_val_samples, train_val_stages, test_size=0.1111, stratify=train_val_stages, random_state=42  # 0.1111 of 90% = 10% of total
+        )
+
+        logger.info(f"After stratified split - Train samples: {len(train_samples)}, Val samples: {len(val_samples)}, Test samples: {len(test_samples)}")
+
+        # Log stage distribution after splitting
+        train_stage_counts = {s: train_stages.count(s) for s in ['early', 'mid', 'advanced']}
+        val_stage_counts = {s: val_stages.count(s) for s in ['early', 'mid', 'advanced']}
+        test_stage_counts = {s: test_stages.count(s) for s in ['early', 'mid', 'advanced']}
+        logger.info(f"Train stage distribution: {train_stage_counts}")
+        logger.info(f"Val stage distribution: {val_stage_counts}")
+        logger.info(f"Test stage distribution: {test_stage_counts}")
+
+        # Check spectral data quality
+        if has_multimodal:
+            spectral_variance = []
+            for idx, sample in enumerate(train_samples[:100]):  # Check first 100 samples
+                spectral = sample[1]
+                if spectral is not None:
+                    spectral_variance.append(torch.var(spectral))
+            avg_spectral_variance = torch.tensor(spectral_variance).mean().item() if spectral_variance else 0.0
+            logger.info(f"Average spectral variance (first 100 samples): {avg_spectral_variance:.6f}")
+            if avg_spectral_variance < 1e-4:
+                logger.warning("Spectral data has very low variance. Disabling multimodal training.")
+                has_multimodal = False
 
         # Step 2: Initialize and Load HVT Model
         hvt_model = HierarchicalVisionTransformer(
@@ -656,14 +683,22 @@ if __name__ == "__main__":
                 logger.warning(f"Error accessing finetune_train_dataset[{idx}]: {e}")
                 continue
         stage_counts = {s: stages.count(s) for s in ['early', 'mid', 'advanced']}
-        logger.info(f"Training set stage distribution: {stage_counts}")
+        logger.info(f"Training set stage distribution (after dataset creation): {stage_counts}")
 
         train_loader = DataLoader(finetune_train_dataset, batch_size=16, shuffle=True, num_workers=16, pin_memory=True)
         val_loader = DataLoader(finetune_val_dataset, batch_size=16, shuffle=False, num_workers=16, pin_memory=True)
         test_loader = DataLoader(finetune_test_dataset, batch_size=16, shuffle=False, num_workers=16, pin_memory=True)
         logger.info("DataLoaders created")
 
-        criterion = nn.CrossEntropyLoss()
+        # Compute class weights based on training set distribution
+        stage_counts = {'early': stage_counts['early'], 'mid': stage_counts['mid'], 'advanced': stage_counts['advanced']}
+        total_samples = sum(stage_counts.values())
+        class_weights = torch.tensor([
+            (total_samples / (3 * stage_counts['early'])),
+            (total_samples / (3 * stage_counts['mid'])),
+            (total_samples / (3 * stage_counts['advanced']))
+        ]).to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
         consistency_criterion = CrossModalConsistencyLoss()
         optimizer = optim.AdamW(ssl_model.parameters(), lr=1e-4, weight_decay=0.1)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
@@ -671,7 +706,7 @@ if __name__ == "__main__":
 
         best_model_path = train_finetune_model(
             ssl_model, train_loader, val_loader, 
-            criterion, consistency_criterion, optimizer, scheduler, num_epochs=20, device=device,
+            criterion, consistency_criterion, optimizer, scheduler, num_epochs=30, device=device,
             train_mean=train_mean, train_std=train_std
         )
 
