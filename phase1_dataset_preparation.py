@@ -18,9 +18,11 @@ logger.info(f"Using device: {device}")
 # Define global variables
 DATA_ROOT = "/teamspace/studios/this_studio/cvpr25/SAR-CLD-2024 A Comprehensive Dataset for Cotton Leaf Disease Detection"
 SAVE_PATH = "./phase1_checkpoints"
+
 if not os.path.exists(DATA_ROOT):
     logger.error(f"Dataset root {DATA_ROOT} not found.")
     raise FileNotFoundError(f"Dataset root {DATA_ROOT} not found.")
+
 os.makedirs(SAVE_PATH, exist_ok=True)
 
 # Step 2: Analyze Datasets
@@ -31,18 +33,19 @@ augmented_stats = analyze_dataset(os.path.join(DATA_ROOT, "Augmented Dataset"), 
 train_transforms, rare_transforms, val_test_transforms = get_transforms()
 
 # Step 4: Load and Split Dataset
-spectral_path = os.path.join(DATA_ROOT, "Spectral Dataset")
-if not os.path.exists(spectral_path):
-    logger.warning("Spectral dataset not found. Simulating NDVI data.")
-    spectral_path = None
-has_multimodal = spectral_path is not None or True
+SPECTRAL_DIR = os.path.join(DATA_ROOT, "Spectral Dataset")
+SIMULATE_SPECTRAL = True # Set to True if you want to simulate data if the directory does not exist
+if not os.path.exists(SPECTRAL_DIR):
+    logger.warning("Spectral directory not found.")
+    SPECTRAL_DIR = None # Set to None to simulate the spectral data
 
 original_train_dataset, original_val_dataset, original_test_dataset, class_names, rare_classes = load_and_split_dataset(
     os.path.join(DATA_ROOT, "Original Dataset"),
     train_transforms,
     rare_transforms,
     val_test_transforms,
-    spectral_path,
+    spectral_dir=SPECTRAL_DIR,
+    simulate_spectral=SIMULATE_SPECTRAL,
     corrupt_images=original_stats['corrupt_images']
 )
 
@@ -52,7 +55,8 @@ augmented_dataset = load_augmented_dataset(
     train_transforms,
     rare_transforms,
     rare_classes,
-    spectral_path,
+    spectral_dir=SPECTRAL_DIR,
+    simulate_spectral=SIMULATE_SPECTRAL,
     corrupt_images=augmented_stats['corrupt_images']
 )
 
@@ -62,7 +66,8 @@ combined_train_dataset = CottonLeafDataset(
     transform=train_transforms,
     rare_transform=rare_transforms,
     rare_classes=rare_classes,
-    spectral_path=spectral_path
+    spectral_dir=SPECTRAL_DIR,
+    simulate_spectral=SIMULATE_SPECTRAL
 )
 
 # Step 7: Create DataLoaders
@@ -74,6 +79,7 @@ train_loader, val_loader, test_loader = create_dataloaders(
 )
 
 # Step 8: Visualize and Save
+has_multimodal = SPECTRAL_DIR is not None or SIMULATE_SPECTRAL
 visualize_batch(train_loader, title="Training Samples", has_multimodal=has_multimodal, save_path=SAVE_PATH)
 visualize_batch(val_loader, title="Validation Samples", has_multimodal=has_multimodal, save_path=SAVE_PATH)
 visualize_batch(test_loader, title="Test Samples", has_multimodal=has_multimodal, save_path=SAVE_PATH)
@@ -88,6 +94,8 @@ checkpoint_data = {
     'original_stats': original_stats,
     'augmented_stats': augmented_stats,
     'has_multimodal': has_multimodal,
+    'spectral_dir': SPECTRAL_DIR,  # Save spectral data path
+    'simulate_spectral': SIMULATE_SPECTRAL, # If spectral data should be simulated if directory does not exist
     'metadata': {
         'version': '1.1',
         'transforms': {
@@ -109,4 +117,5 @@ logger.info(f"Class names: {class_names}")
 logger.info(f"Rare classes: {[class_names[i] for i in rare_classes]}")
 logger.info(f"Class imbalance ratio (original): {original_stats['class_imbalance_ratio']:.2f}")
 logger.info(f"Multimodal support: {has_multimodal}")
+logger.info(f"Simulate Spectral: {SIMULATE_SPECTRAL}") # Log the data simulation status
 logger.info("Phase 1 completed: Dataset prepared with class-specific augmentations and multimodal integration set up.")
