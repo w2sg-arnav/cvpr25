@@ -11,6 +11,7 @@ import logging
 import time
 from PIL import Image
 from data_utils import CottonLeafDataset, get_transforms, create_dataloaders
+from hvt_model import HierarchicalVisionTransformer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,7 +34,7 @@ if not os.path.exists(CHECKPOINT_PATH):
     raise FileNotFoundError(f"Phase 2 checkpoint not found at {CHECKPOINT_PATH}")
 
 phase2_results = torch.load(CHECKPOINT_PATH)
-class_names = phase2_results['inception']['report'].keys()
+class_names = phase2_results['hvt']['report'].keys() # Use hvt now
 num_classes = len(class_names)
 has_multimodal = True  # Assuming multimodal support from Phase 1
 
@@ -47,6 +48,8 @@ checkpoint_data = torch.load(PHASE1_CHECKPOINT_PATH)
 train_dataset = checkpoint_data['train_dataset']
 val_dataset = checkpoint_data['val_dataset']
 rare_classes = checkpoint_data['rare_classes']
+train_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+train_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
 # Custom SSL Dataset for Pretraining
 class SSLCottonLeafDataset(Dataset):
@@ -70,23 +73,11 @@ class SSLCottonLeafDataset(Dataset):
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
         try:
-            img = Image.open(img_path).convert('RGB')
-            spectral = None
-            
-            if self.has_multimodal:
-                spectral = self.simulate_spectral_from_rgb(img)
-                spectral = transforms.Resize((299, 299))(spectral)
-                spectral = transforms.ToTensor()(spectral).squeeze(0)
-            
-            # Apply random progression stage augmentation
+            img,spectral,target = train_dataset[idx]
+
             stage = np.random.choice(['early', 'mid', 'advanced'])
             img = self.progression_stages[stage](img)
-            
-            if label in self.rare_classes and self.rare_transform:
-                img = self.rare_transform(img)
-            elif self.transform:
-                img = self.transform(img)
-            
+
             return img, spectral, stage
         except Exception as e:
             logger.error(f"Error loading image {img_path}: {e}")
@@ -116,7 +107,7 @@ def random_rectangular_masking(images, mask_ratio=0.3):
 
 # SSL HVT Model with Pretext Tasks
 class SSLHierarchicalVisionTransformer(nn.Module):
-    def __init__(self, base_model, embed_dim=768, num_classes=7, dropout=0.1):
+    def __init__(self, base_model, embed_dim=768):
         super().__init__()
         self.base_model = base_model
         self.projection_head = nn.Sequential(
@@ -130,8 +121,7 @@ class SSLHierarchicalVisionTransformer(nn.Module):
         if mask is not None:
             rgb = rgb * mask
         features = self.base_model(rgb, spectral)
-        cls_features = features[:, 0]
-        projection = self.projection_head(cls_features)
+        projection = self.projection_head(features)
         progression_logits = self.progression_head(projection)
         return projection, progression_logits
 
@@ -140,8 +130,8 @@ class SSLHierarchicalVisionTransformer(nn.Module):
             if mask is not None:
                 rgb = rgb * mask
             features = self.base_model(rgb, spectral)
-            cls_features = features[:, 0]
-            return self.projection_head(cls_features)
+            features = features[:, 0]
+            return self.projection_head(features)
 
 # Contrastive Loss
 class InfoNCECrossModalLoss(nn.Module):
@@ -181,6 +171,8 @@ def train_ssl_model(model, train_loader, val_loader, criterion_progression, crit
         for batch in train_loader:
             images, spectral, stage = batch[0].to(device), batch[1].to(device) if has_multimodal else None, batch[2]
             stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
+            if images.min() >= 0 and images.max() <= 1:
+                images = (images - train_mean) / train_std
             
             optimizer.zero_grad()
             with autocast():
@@ -213,6 +205,8 @@ def train_ssl_model(model, train_loader, val_loader, criterion_progression, crit
             for batch in val_loader:
                 images, spectral, stage = batch[0].to(device), batch[1].to(device) if has_multimodal else None, batch[2]
                 stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
+                if images.min() >= 0 and images.max() <= 1:
+                    images = (images - train_mean) / train_std
                 
                 masked_images, _ = random_rectangular_masking(images, mask_ratio)
                 proj_features, prog_logits = model(images, spectral)
@@ -259,11 +253,17 @@ if __name__ == "__main__":
 
     # Step 2: Load HVT from Phase 2
     hvt_model = HierarchicalVisionTransformer(
-        img_size=299, patch_sizes=[16, 32], in_chans=3, embed_dim=768, 
-        num_heads=12, depth=16, num_classes=num_classes, dropout=0.1
+        num_classes=num_classes,
+        img_size=299, 
+        patch_sizes=[16, 8, 4], 
+        embed_dims=[768, 384, 192],
+        num_heads=12, 
+        num_layers=16,
+        has_multimodal=has_multimodal,
+        dropout=0.1
     ).to(device)
     hvt_model.load_state_dict(torch.load("./phase2_checkpoints/HVT_best.pth"))
-    ssl_model = SSLHierarchicalVisionTransformer(hvt_model, embed_dim=768, num_classes=7).to(device)
+    ssl_model = SSLHierarchicalVisionTransformer(hvt_model, embed_dim=768).to(device)
 
     # Step 3: Define Loss Functions and Optimizer
     criterion_progression = nn.CrossEntropyLoss()
