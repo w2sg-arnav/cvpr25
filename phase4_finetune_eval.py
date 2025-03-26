@@ -1,9 +1,9 @@
-# phase4_finetune_eval.py
+from hvt_model import HierarchicalVisionTransformer, SSLHierarchicalVisionTransformer
 import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 from torchvision import transforms, models
@@ -16,10 +16,8 @@ from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy import stats
-from data_utils import CottonLeafDataset, get_transforms
-from hvt_model import HierarchicalVisionTransformer
-from phase3_ssl_hvt import SSLHierarchicalVisionTransformer
-import torchvision
+from copy import deepcopy
+import cv2
 from ptflops import get_model_complexity_info
 
 # Set up logging
@@ -35,28 +33,22 @@ np.random.seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
 
-class FinetuneCottonLeafDataset(Dataset):
-    def __init__(self, samples, transform=None, rare_transform=None, rare_classes=None, has_multimodal=False, is_test=False, resolution=288, label_to_stage=None):
+class EnhancedFinetuneDataset(Dataset):
+    def __init__(self, samples, transform=None, rare_transform=None, rare_classes=None, 
+                 has_multimodal=False, is_test=False, resolution=288, label_to_stage=None):
         self.transform = transform
         self.rare_transform = rare_transform
         self.rare_classes = rare_classes or []
         self.has_multimodal = has_multimodal
         self.is_test = is_test
         self.resolution = resolution
-        self.label_to_stage = label_to_stage  # Mapping from original labels to stages
+        self.label_to_stage = label_to_stage
 
         # Validate and clean samples
         self.samples = []
-        invalid_indices = []
-        reported_length = len(samples) if isinstance(samples, (list, tuple)) else 0
-        logger.info(f"Reported length of input samples: {reported_length}")
-
-        for idx in range(reported_length):
+        for idx in range(len(samples)):
             try:
                 sample = samples[idx]
-                logger.debug(f"Sample {idx} type: {type(sample)}, value: {sample}")
-
-                # Handle different sample formats
                 if isinstance(sample, dict):
                     img = sample.get('img')
                     spectral = sample.get('spectral')
@@ -64,136 +56,127 @@ class FinetuneCottonLeafDataset(Dataset):
                 elif isinstance(sample, (list, tuple)) and len(sample) >= 3:
                     img, spectral, label = sample[:3]
                 else:
-                    logger.warning(f"Sample {idx} has unexpected format: {sample}")
-                    invalid_indices.append(idx)
                     continue
 
-                # Validate img and spectral
                 if img is None:
-                    logger.warning(f"Sample {idx} has None img")
-                    invalid_indices.append(idx)
                     continue
 
-                if self.has_multimodal and spectral is None:
-                    logger.debug(f"Sample {idx} has None spectral, but has_multimodal is True. Proceeding with None spectral.")
-                    spectral = None
-
-                # Convert img and spectral to tensors if they aren't already
                 if not isinstance(img, torch.Tensor):
                     img = transforms.ToTensor()(img)
 
                 if img.dim() < 2:
-                    logger.warning(f"Sample {idx} img has {img.dim()} dimensions, reshaping to 2D")
                     img = img.view(-1, 1)
 
                 if self.has_multimodal and spectral is not None:
                     if not isinstance(spectral, torch.Tensor):
                         spectral = transforms.ToTensor()(spectral)
                     if spectral.dim() < 2:
-                        logger.warning(f"Sample {idx} spectral has {spectral.dim()} dimensions, reshaping to 2D")
                         spectral = spectral.view(-1, 1)
 
                 self.samples.append((img, spectral, label))
-            except Exception as e:
-                logger.warning(f"Error accessing or processing sample at index {idx}: {e}")
-                invalid_indices.append(idx)
+            except Exception:
                 continue
 
-        if invalid_indices:
-            logger.warning(f"Found {len(invalid_indices)} invalid samples at indices: {invalid_indices[:10]}{'...' if len(invalid_indices) > 10 else ''}")
         logger.info(f"Dataset initialized with {len(self.samples)} valid samples")
 
-        if len(self.samples) == 0:
-            raise ValueError("No valid samples found in the dataset. Cannot proceed with training.")
-
+        # Enhanced augmentation strategies
         self.progression_stages = {
-            'early': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.1), 1.1),
-            'mid': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.3), 1.3),
-            'advanced': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.5), 1.5)
+            'early': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.3), 1.3),
+            'mid': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.5), 1.5),
+            'advanced': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.8), 1.8)
         }
 
         self.augmentation = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=45),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2),
-            transforms.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.7, 1.0)),
-            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
-            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),  # Add blur
-            transforms.Lambda(lambda x: x + torch.randn_like(x) * 0.1),  # Add noise
+            transforms.RandomRotation(degrees=30),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+            transforms.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.8, 1.0)),
+            transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+            transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.5),
         ])
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        if idx >= len(self.samples):
-            logger.error(f"Index {idx} is out of range for dataset with {len(self.samples)} samples")
-            raise IndexError(f"Index {idx} is out of range for dataset with {len(self.samples)} samples")
-        try:
-            img, spectral, label = self.samples[idx]
+        img, spectral, label = self.samples[idx]
+        stage = self.label_to_stage.get(label, 'mid')
 
-            # Map the original label to a stage
-            if self.label_to_stage is not None:
-                stage = self.label_to_stage.get(label)
-                if stage is None:
-                    logger.warning(f"Label {label} at index {idx} does not map to a valid stage. Using 'mid' as default.")
-                    stage = 'mid'
-            else:
-                stage = 'mid'  # Fallback if no mapping is provided
+        # Convert to 3-channel if needed
+        if not isinstance(img, torch.Tensor):
+            img = transforms.ToTensor()(img)
+        
+        if img.dim() == 2:
+            img = img.unsqueeze(0)
+        if img.shape[0] == 1:
+            img = img.repeat(3, 1, 1)
 
-            # Ensure img is a tensor
-            if not isinstance(img, torch.Tensor):
-                img = transforms.ToTensor()(img)
-            
-            if img.dim() == 2:
-                img = img.unsqueeze(0)
-            if img.shape[0] == 1:
-                img = img.repeat(3, 1, 1)
+        # Resize and ensure proper dimensions
+        img = transforms.Resize((self.resolution, self.resolution))(img)
+        img = img[:3, :, :]  # Ensure 3 channels
 
-            if img.shape[0] != 3 or img.shape[1] != self.resolution or img.shape[2] != self.resolution:
-                img = transforms.Resize((self.resolution, self.resolution))(img)
-                if img.shape[0] != 3:
-                    img = img[:3, :, :]
+        if not self.is_test:
+            img = self.augmentation(img)
+            img = self.progression_stages[stage](img)
 
-            if not self.is_test:
-                img = self.augmentation(img)
+        if self.transform:
+            for t in self.transform.transforms:
+                if not isinstance(t, transforms.ToTensor):
+                    img = t(img)
 
-            if self.transform:
-                for t in self.transform.transforms:
-                    if not isinstance(t, transforms.ToTensor):
-                        img = t(img)
+        if not self.is_test and label in self.rare_classes and self.rare_transform:
+            for t in self.rare_transform.transforms:
+                if not isinstance(t, transforms.ToTensor):
+                    img = t(img)
 
-            if not self.is_test:
-                img = self.progression_stages[stage](img)
+        if self.has_multimodal and spectral is not None:
+            if not isinstance(spectral, torch.Tensor):
+                spectral = transforms.ToTensor()(spectral)
+            if spectral.dim() == 2:
+                spectral = spectral.unsqueeze(0)
+            spectral = transforms.Resize((self.resolution, self.resolution))(spectral)
+            spectral = spectral[:1, :, :]  # Ensure 1 channel
 
-            if not self.is_test and label in self.rare_classes and self.rare_transform:
-                for t in self.rare_transform.transforms:
-                    if not isinstance(t, transforms.ToTensor):
-                        img = t(img)
+        return img, spectral, stage
 
-            if self.has_multimodal and spectral is not None:
-                if not isinstance(spectral, torch.Tensor):
-                    spectral = transforms.ToTensor()(spectral)
-                if spectral.dim() == 2:
-                    spectral = spectral.unsqueeze(0)
-                if spectral.shape[0] != 1 or spectral.shape[1] != self.resolution or spectral.shape[2] != self.resolution:
-                    spectral = transforms.Resize((self.resolution, self.resolution))(spectral)
-                    spectral = spectral[:1, :, :]
-
-            return img, spectral, stage
-
-        except Exception as e:
-            logger.warning(f"Error loading sample at index {idx}: {e}. Returning placeholder.")
-            return torch.zeros((3, self.resolution, self.resolution)), torch.zeros((1, self.resolution, self.resolution)) if self.has_multimodal else None, 'mid'
+class EnhancedFocalLoss(nn.Module):
+    def __init__(self, gamma=1.5, alpha=None, label_smoothing=0.15, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        num_classes = inputs.size(1)
+        log_probs = F.log_softmax(inputs, dim=1)
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).float()
+        targets_smooth = targets_one_hot * (1 - self.label_smoothing) + self.label_smoothing / num_classes
+        
+        if self.alpha is not None:
+            weights = self.alpha[targets].unsqueeze(1)
+            log_probs = log_probs * weights
+        
+        pt = torch.exp(log_probs) * targets_smooth
+        pt = pt.sum(dim=1)
+        focal_loss = -((1 - pt) ** self.gamma) * log_probs * targets_smooth
+        
+        if self.reduction == 'mean':
+            return focal_loss.sum(dim=1).mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
 class CrossModalConsistencyLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, temperature=0.1):
         super().__init__()
-
+        self.temperature = temperature
+        
     def forward(self, rgb_logits, spectral_logits):
-        rgb_probs = F.softmax(rgb_logits, dim=1)
-        spectral_probs = F.softmax(spectral_logits, dim=1)
+        rgb_probs = F.softmax(rgb_logits / self.temperature, dim=1)
+        spectral_probs = F.softmax(spectral_logits / self.temperature, dim=1)
         kl_loss = F.kl_div(rgb_probs.log(), spectral_probs, reduction='batchmean')
         return kl_loss
 
@@ -208,27 +191,96 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
-def train_finetune_model(model, train_loader, val_loader, criterion, consistency_criterion, optimizer, scheduler, num_epochs, device, train_mean, train_std):
-    scaler = GradScaler()
-    best_val_loss = float('inf')
-    best_model_path = "./phase4_checkpoints/finetuned_best.pth"
-    os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
+def cutmix_data(x, y, alpha=1.0):
+    lam = np.random.beta(alpha, alpha)
+    rand_index = torch.randperm(x.size()[0]).to(x.device)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+    return x, y, y[rand_index], lam
 
-    patience = 5
-    epochs_no_improve = 0
-    early_stop = False
+def rand_bbox(size, lam):
+    W, H = size[2], size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    return bbx1, bby1, bbx2, bby2
 
-    logger.info(f"Training DataLoader has {len(train_loader.dataset)} samples, {len(train_loader)} batches")
-    logger.info(f"Validation DataLoader has {len(val_loader.dataset)} samples, {len(val_loader)} batches")
+def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer, 
+               scheduler, scaler, device, train_mean, train_std, ema_model=None):
+    model.train()
+    running_loss = 0.0
+    running_consistency_loss = 0.0
+    correct = 0
+    total = 0
+    
+    for batch_idx, (images, spectral, stage) in enumerate(train_loader):
+        images = images.to(device)
+        spectral = spectral.to(device) if spectral is not None else None
+        stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
+        
+        if images.min() >= 0 and images.max() <= 1:
+            images = (images - train_mean) / train_std
 
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        running_consistency_loss = 0.0
-        correct = 0
-        total = 0
+        optimizer.zero_grad()
+        
+        with autocast():
+            # Apply MixUp or CutMix
+            if np.random.rand() < 0.5:
+                images, stage_a, stage_b, lam = mixup_data(images, stage, alpha=1.0, device=device)
+            else:
+                images, stage_a, stage_b, lam = cutmix_data(images, stage, alpha=1.0)
+            
+            _, rgb_logits = model(images, spectral)
+            _, spectral_logits = model(images, None) if spectral is not None else (None, rgb_logits)
+            
+            class_loss = lam * criterion(rgb_logits, stage_a) + (1 - lam) * criterion(rgb_logits, stage_b)
+            consistency_loss = consistency_criterion(rgb_logits, spectral_logits) if spectral is not None else 0.0
+            total_loss = class_loss + 0.5 * consistency_loss
 
-        for batch_idx, (images, spectral, stage) in enumerate(train_loader):
+        scaler.scale(total_loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
+        if ema_model is not None:
+            model_ema(model, ema_model)
+        
+        scheduler.step()
+        
+        running_loss += class_loss.item() * images.size(0)
+        running_consistency_loss += consistency_loss.item() * images.size(0) if spectral is not None else 0.0
+        _, predicted = torch.max(rgb_logits, 1)
+        total += stage.size(0)
+        correct += (lam * (predicted == stage_a).sum().item() + 
+                   (1 - lam) * (predicted == stage_b).sum().item())
+
+    epoch_loss = running_loss / len(train_loader.dataset)
+    epoch_consistency_loss = running_consistency_loss / len(train_loader.dataset)
+    epoch_acc = 100 * correct / total
+    
+    return epoch_loss, epoch_consistency_loss, epoch_acc
+
+def model_ema(model, ema_model, decay=0.999):
+    model_params = dict(model.named_parameters())
+    ema_params = dict(ema_model.named_parameters())
+    for name in ema_params:
+        ema_params[name].data = decay * ema_params[name].data + (1 - decay) * model_params[name].data
+
+def validate(model, val_loader, criterion, device, train_mean, train_std, class_names):
+    model.eval()
+    val_loss = 0.0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, spectral, stage in val_loader:
             images = images.to(device)
             spectral = spectral.to(device) if spectral is not None else None
             stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
@@ -236,65 +288,82 @@ def train_finetune_model(model, train_loader, val_loader, criterion, consistency
             if images.min() >= 0 and images.max() <= 1:
                 images = (images - train_mean) / train_std
 
-            optimizer.zero_grad()
+            # Test-time augmentation
+            outputs = []
+            for _ in range(3):
+                aug_images = transforms.Compose([
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
+                ])(images)
+                
+                _, logits = model(aug_images, spectral)
+                outputs.append(F.softmax(logits, dim=1))
             
-            with autocast():
-                images, stage_a, stage_b, lam = mixup_data(images, stage, alpha=1.0, device=device)
-                _, rgb_logits = model(images, spectral)
-                _, spectral_logits = model(images, None) if spectral is not None else rgb_logits
-                class_loss = lam * criterion(rgb_logits, stage_a) + (1 - lam) * criterion(rgb_logits, stage_b)
-                consistency_loss = consistency_criterion(rgb_logits, spectral_logits) if spectral is not None else 0.0
-                total_loss = class_loss + 1.0 * consistency_loss
+            avg_probs = torch.mean(torch.stack(outputs), dim=0)
+            loss = criterion(avg_probs.log(), stage)
+            
+            val_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(avg_probs, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(stage.cpu().numpy())
 
-            scaler.scale(total_loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+    val_loss = val_loss / len(val_loader.dataset)
+    val_acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    cm = confusion_matrix(all_labels, all_preds)
+    per_class_acc = cm.diagonal() / cm.sum(axis=1)
+    per_class_acc_dict = {class_names[i]: acc for i, acc in enumerate(per_class_acc)}
+    
+    return val_loss, val_acc, f1, per_class_acc_dict, cm
 
-            running_loss += class_loss.item() * images.size(0)
-            running_consistency_loss += consistency_loss.item() * images.size(0) if spectral is not None else 0.0
-            _, predicted = torch.max(rgb_logits, 1)
-            total += stage.size(0)
-            correct += (predicted == stage_a).sum().item()
+def train_finetune_model(model, train_loader, val_loader, criterion, consistency_criterion, 
+                        optimizer, scheduler, num_epochs, device, train_mean, train_std, class_names):
+    scaler = GradScaler()
+    best_val_acc = 0.0
+    best_model_path = "./phase4_checkpoints/finetuned_best.pth"
+    os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
 
-            if batch_idx % 50 == 0:
-                logger.info(f"Epoch {epoch+1}/{num_epochs} | Batch {batch_idx}/{len(train_loader)} | Class Loss: {class_loss.item():.4f} | Consistency Loss: {consistency_loss.item():.4f}")
-                logger.info(f"GPU Memory Allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB | Reserved: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
+    # Create EMA model
+    ema_model = deepcopy(model)
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
 
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_consistency_loss = running_consistency_loss / len(train_loader.dataset)
-        epoch_acc = 100 * correct / total
-        logger.info(f"Epoch {epoch+1}/{num_epochs} - Training Class Loss: {epoch_loss:.4f}, Consistency Loss: {epoch_consistency_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+    patience = 5
+    epochs_no_improve = 0
+    early_stop = False
 
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        with torch.no_grad():
-            for images, spectral, stage in val_loader:
-                images = images.to(device)
-                spectral = spectral.to(device) if spectral is not None else None
-                stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
-
-                if images.min() >= 0 and images.max() <= 1:
-                    images = (images - train_mean) / train_std
-
-                _, logits = model(images, spectral)
-                loss = criterion(logits, stage)
-
-                val_loss += loss.item() * images.size(0)
-                _, predicted = torch.max(logits, 1)
-                val_total += stage.size(0)
-                val_correct += (predicted == stage).sum().item()
-
-        val_loss = val_loss / len(val_loader.dataset)
-        val_acc = 100 * val_correct / val_total
-        logger.info(f"Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.2f}%")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+    for epoch in range(num_epochs):
+        train_loss, train_cons_loss, train_acc = train_epoch(
+            model, train_loader, criterion, consistency_criterion, 
+            optimizer, scheduler, scaler, device, train_mean, train_std, ema_model
+        )
+        
+        logger.info(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, "
+                   f"Cons Loss: {train_cons_loss:.4f}, Acc: {train_acc:.2f}%")
+        
+        # Validate both regular and EMA model
+        val_loss, val_acc, val_f1, per_class_acc, cm = validate(
+            model, val_loader, criterion, device, train_mean, train_std, class_names
+        )
+        ema_val_loss, ema_val_acc, ema_val_f1, _, _ = validate(
+            ema_model, val_loader, criterion, device, train_mean, train_std, class_names
+        )
+        
+        logger.info(f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+        logger.info(f"EMA Validation - Loss: {ema_val_loss:.4f}, Acc: {ema_val_acc:.4f}, F1: {ema_val_f1:.4f}")
+        logger.info(f"Per-class accuracy: {per_class_acc}")
+        
+        # Save best model (regular or EMA)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             torch.save(model.state_dict(), best_model_path)
-            logger.info(f"Saved best model with Val Loss: {best_val_loss:.4f}")
+            logger.info(f"Saved new best model with Val Acc: {best_val_acc:.4f}")
+            epochs_no_improve = 0
+        elif ema_val_acc > best_val_acc:
+            best_val_acc = ema_val_acc
+            torch.save(ema_model.state_dict(), best_model_path)
+            logger.info(f"Saved new best EMA model with Val Acc: {best_val_acc:.4f}")
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -303,206 +372,21 @@ def train_finetune_model(model, train_loader, val_loader, criterion, consistency
                 early_stop = True
                 break
 
-        scheduler.step(val_loss)
-        logger.info(f"Learning rate: {scheduler.optimizer.param_groups[0]['lr']:.6f}")
-
         if early_stop:
             break
 
     return best_model_path
 
-def mc_dropout_inference(model, images, spectral, num_samples=10):
-    model.eval()
-    model.apply(lambda m: setattr(m, 'training', True))
-    predictions = []
-    for _ in range(num_samples):
-        with torch.no_grad():
-            _, logits = model(images, spectral)
-            probs = F.softmax(logits, dim=1)
-            predictions.append(probs)
-    predictions = torch.stack(predictions)
-    mean_probs = predictions.mean(dim=0)
-    uncertainty = predictions.var(dim=0).mean(dim=1)
-    return mean_probs, uncertainty
-
-def grad_cam(model, images, target_class, device):
-    model.eval()
-    images = images.requires_grad_(True)
-    _, logits = model(images, None)
-    model.zero_grad()
-    logits[:, target_class].sum().backward()
-    gradients = images.grad
-    activations = model.base_model.features(images, None)
-    weights = gradients.mean(dim=(2, 3), keepdim=True)
-    grad_cam_map = (weights * activations).sum(dim=1, keepdim=True)
-    grad_cam_map = F.relu(grad_cam_map)
-    grad_cam_map = F.interpolate(grad_cam_map, size=(images.shape[2], images.shape[3]), mode='bilinear', align_corners=False)
-    grad_cam_map = grad_cam_map / (grad_cam_map.max() + 1e-8)
-    return grad_cam_map
-
-def evaluate_model(model, test_loader, criterion, device, train_mean, train_std, class_names, robustness_tests=False):
-    model.eval()
-    test_loss = 0.0
-    all_preds = []
-    all_labels = []
-    all_uncertainties = []
-    
-    if robustness_tests:
-        degradation_transforms = [
-            ("Blur", transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))),
-            ("Noise", lambda x: x + torch.randn_like(x) * 0.1),
-            ("Occlusion", lambda x: x * (torch.rand_like(x) > 0.2).float()),
-            ("Lighting", transforms.ColorJitter(brightness=0.5))
-        ]
-    else:
-        degradation_transforms = [("Normal", lambda x: x)]
-
-    for test_name, degradation in degradation_transforms:
-        logger.info(f"Evaluating with {test_name} degradation...")
-        test_loss = 0.0
-        all_preds = []
-        all_labels = []
-        all_uncertainties = []
-
-        with torch.no_grad():
-            for images, spectral, stage in test_loader:
-                images = images.to(device)
-                spectral = spectral.to(device) if spectral is not None else None
-                stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
-
-                if images.min() >= 0 and images.max() <= 1:
-                    images = (images - train_mean) / train_std
-
-                images = degradation(images)
-
-                probs, uncertainty = mc_dropout_inference(model, images, spectral)
-                loss = criterion(probs.log(), stage)
-
-                test_loss += loss.item() * images.size(0)
-                _, predicted = torch.max(probs, 1)
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(stage.cpu().numpy())
-                all_uncertainties.extend(uncertainty.cpu().numpy())
-
-        test_loss = test_loss / len(test_loader.dataset)
-        accuracy = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='weighted')
-        cm = confusion_matrix(all_labels, all_preds)
-
-        n = len(all_labels)
-        acc_se = np.sqrt((accuracy * (1 - accuracy)) / n)
-        ci_lower, ci_upper = stats.norm.interval(0.95, loc=accuracy, scale=acc_se)
-
-        logger.info(f"{test_name} Test Loss: {test_loss:.4f}")
-        logger.info(f"{test_name} Test Accuracy: {accuracy:.4f} (95% CI: [{ci_lower:.4f}, {ci_upper:.4f}])")
-        logger.info(f"{test_name} Test F1 Score: {f1:.4f}")
-        logger.info(f"{test_name} Average Uncertainty: {np.mean(all_uncertainties):.4f}")
-        logger.info(f"{test_name} Confusion Matrix:")
-        logger.info(cm)
-
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title(f'Confusion Matrix ({test_name})')
-        plt.savefig(f'./phase4_checkpoints/confusion_matrix_{test_name.lower()}.png')
-        plt.close()
-
-    return test_loss, accuracy, f1, cm, all_uncertainties
-
-def evaluate_baselines(test_loader, device, train_mean, train_std):
-    # Initialize ResNet-50
-    resnet = models.resnet50(pretrained=True)
-    resnet.fc = nn.Linear(resnet.fc.in_features, 3)
-    resnet = resnet.to(device)
-    resnet.eval()
-
-    # Initialize ViT
-    vit = models.vit_b_16(pretrained=True)
-    vit.heads = nn.Linear(vit.heads.head.in_features, 3)
-    vit = vit.to(device)
-    vit.eval()
-
-    # Define resize transform for ViT (224x224)
-    resize_to_224 = transforms.Resize((224, 224))
-
-    criterion = nn.CrossEntropyLoss()
-    baselines = {"ResNet-50": (resnet, None), "ViT": (vit, resize_to_224)}
-    results = {}
-
-    for name, (model, resize_transform) in baselines.items():
-        test_loss = 0.0
-        all_preds = []
-        all_labels = []
-
-        with torch.no_grad():
-            for images, spectral, stage in test_loader:
-                images = images.to(device)
-                stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
-
-                if images.min() >= 0 and images.max() <= 1:
-                    images = (images - train_mean) / train_std
-
-                # Resize images if required by the model
-                if resize_transform is not None:
-                    images = resize_transform(images)
-
-                logits = model(images)
-                loss = criterion(logits, stage)
-
-                test_loss += loss.item() * images.size(0)
-                _, predicted = torch.max(logits, 1)
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(stage.cpu().numpy())
-
-        test_loss = test_loss / len(test_loader.dataset)
-        accuracy = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='weighted')
-
-        results[name] = {"loss": test_loss, "accuracy": accuracy, "f1": f1}
-        logger.info(f"Baseline {name} - Test Loss: {test_loss:.4f}, Accuracy: {accuracy:.4f}, F1 Score: {f1:.4f}")
-
-    return results
-
-def ablation_study(model, test_loader, criterion, device, train_mean, train_std, class_names):
-    model.eval()
-    test_loss_rgb = 0.0
-    all_preds_rgb = []
-    all_labels_rgb = []
-
-    with torch.no_grad():
-        for images, spectral, stage in test_loader:
-            images = images.to(device)
-            stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
-
-            if images.min() >= 0 and images.max() <= 1:
-                images = (images - train_mean) / train_std
-
-            _, logits = model(images, None)
-            loss = criterion(logits, stage)
-
-            test_loss_rgb += loss.item() * images.size(0)
-            _, predicted = torch.max(logits, 1)
-            all_preds_rgb.extend(predicted.cpu().numpy())
-            all_labels_rgb.extend(stage.cpu().numpy())
-
-    test_loss_rgb = test_loss_rgb / len(test_loader.dataset)
-    accuracy_rgb = accuracy_score(all_labels_rgb, all_preds_rgb)
-    f1_rgb = f1_score(all_labels_rgb, all_preds_rgb, average='weighted')
-
-    logger.info(f"Ablation (RGB Only) - Test Loss: {test_loss_rgb:.4f}, Accuracy: {accuracy_rgb:.4f}, F1 Score: {f1_rgb:.4f}")
-
-    return {"RGB_Only": {"loss": test_loss_rgb, "accuracy": accuracy_rgb, "f1": f1_rgb}}
-
-if __name__ == "__main__":
+def main():
     try:
+        # Configuration
         PHASE1_CHECKPOINT_PATH = "./phase1_checkpoints/phase1_preprocessed_data.pth"
         HVT_CHECKPOINT_PATH = "./phase2_checkpoints/HVT_best.pth"
         SSL_CHECKPOINT_PATH = "./phase3_checkpoints/ssl_hvt_best.pth"
         PHASE4_SAVE_PATH = "./phase4_checkpoints"
         os.makedirs(PHASE4_SAVE_PATH, exist_ok=True)
 
-        # Step 1: Load and Inspect Phase 1 Data
+        # Load data
         checkpoint_data = torch.load(PHASE1_CHECKPOINT_PATH)
         train_dataset = checkpoint_data['train_dataset']
         val_dataset = checkpoint_data['val_dataset']
@@ -511,266 +395,163 @@ if __name__ == "__main__":
         has_multimodal = checkpoint_data['has_multimodal']
         train_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
         train_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
-        class_names = checkpoint_data['class_names']
+        class_names = ['early', 'mid', 'advanced']
         num_classes = len(class_names)
-        logger.info("Successfully loaded Phase 1 data")
-        logger.info(f"Phase 1 checkpoint contents: {list(checkpoint_data.keys())}")
-        logger.info(f"Reported train_dataset length: {len(train_dataset)}")
-        logger.info(f"Reported val_dataset length: {len(val_dataset)}")
-        logger.info(f"Reported test_dataset length: {len(test_dataset)}")
-        logger.info(f"has_multimodal: {has_multimodal}")
-        logger.info(f"train_dataset type: {type(train_dataset)}")
-        logger.info(f"class_names: {class_names}")
 
-        # Define mapping from original labels to stages
+        # Label to stage mapping
         label_to_stage = {
-            0: 'early',       # 'Bacterial Blight' - early stage of bacterial disease
-            1: 'advanced',    # 'Curl Virus' - advanced stage of viral disease
-            2: 'healthy',     # 'Healthy Leaf' - to be filtered out
-            3: 'damage',      # 'Herbicide Growth Damage' - to be filtered out
-            4: 'early',       # 'Leaf Hopper Jassids' - early pest damage
-            5: 'mid',         # 'Leaf Redding' - mid-stage symptom
-            6: 'advanced'     # 'Leaf Variegation' - advanced symptom
+            0: 'early', 1: 'advanced', 2: 'healthy', 
+            3: 'damage', 4: 'early', 5: 'mid', 6: 'advanced'
         }
-        logger.info(f"Label to stage mapping: {label_to_stage}")
 
-        # Valid stages for training (exclude 'healthy', 'damage')
-        valid_stages = {'early', 'mid', 'advanced'}
-
-        # Log label distribution before filtering
-        def log_label_distribution(dataset, dataset_name):
-            label_counts = {}
-            for idx in range(len(dataset)):
-                try:
-                    sample = dataset[idx]
-                    label = sample[2]  # Label is the third element in the tuple
-                    label_counts[label] = label_counts.get(label, 0) + 1
-                except Exception as e:
-                    logger.warning(f"Error accessing {dataset_name}[{idx}]: {e}")
-                    continue
-            logger.info(f"Label distribution in {dataset_name} before filtering: {label_counts}")
-
-        log_label_distribution(train_dataset, "train_dataset")
-        log_label_distribution(val_dataset, "val_dataset")
-        log_label_distribution(test_dataset, "test_dataset")
-
-        # Combine all samples and re-split with stratification
-        logger.info("Combining all samples for stratified splitting...")
+        # Combine and split data
         all_samples = []
         all_stages = []
-        for dataset, name in [(train_dataset, "train_dataset"), (val_dataset, "val_dataset"), (test_dataset, "test_dataset")]:
+        for dataset in [train_dataset, val_dataset, test_dataset]:
             for idx in range(len(dataset)):
                 try:
                     sample = dataset[idx]
-                    label = sample[2]
+                    label = sample[2] if isinstance(sample, (list, tuple)) else sample['label']
                     stage = label_to_stage.get(label)
-                    if stage is None:
-                        logger.warning(f"Label {label} at index {idx} in {name} not in label_to_stage mapping. Skipping.")
-                        continue
-                    if stage not in valid_stages:
-                        continue
-                    all_samples.append(sample)
-                    all_stages.append(stage)
-                except Exception as e:
-                    logger.warning(f"Error accessing {name}[{idx}]: {e}")
+                    if stage in ['early', 'mid', 'advanced']:
+                        all_samples.append(sample)
+                        all_stages.append(stage)
+                except Exception:
                     continue
-        logger.info(f"Total valid samples after filtering: {len(all_samples)}")
 
-        # Stratified split: 80% train, 10% val, 10% test
+        # Stratified split
         train_val_samples, test_samples, train_val_stages, test_stages = train_test_split(
             all_samples, all_stages, test_size=0.1, stratify=all_stages, random_state=42
         )
-        train_samples, val_samples, train_val_stages, val_stages = train_test_split(
-            train_val_samples, train_val_stages, test_size=0.1111, stratify=train_val_stages, random_state=42  # 0.1111 of 90% = 10% of total
+        train_samples, val_samples, train_stages, val_stages = train_test_split(
+            train_val_samples, train_val_stages, test_size=0.1111, stratify=train_val_stages, random_state=42
         )
 
-        logger.info(f"After stratified split - Train samples: {len(train_samples)}, Val samples: {len(val_samples)}, Test samples: {len(test_samples)}")
+        # Create datasets
+        train_transforms = transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        test_transforms = transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-        # Log stage distribution after splitting
-        train_stage_counts = {s: train_stages.count(s) for s in ['early', 'mid', 'advanced']}
-        val_stage_counts = {s: val_stages.count(s) for s in ['early', 'mid', 'advanced']}
-        test_stage_counts = {s: test_stages.count(s) for s in ['early', 'mid', 'advanced']}
-        logger.info(f"Train stage distribution: {train_stage_counts}")
-        logger.info(f"Val stage distribution: {val_stage_counts}")
-        logger.info(f"Test stage distribution: {test_stage_counts}")
+        train_dataset = EnhancedFinetuneDataset(
+            train_samples, transform=train_transforms, rare_classes=rare_classes,
+            has_multimodal=has_multimodal, resolution=288, label_to_stage=label_to_stage
+        )
+        val_dataset = EnhancedFinetuneDataset(
+            val_samples, transform=train_transforms, rare_classes=rare_classes,
+            has_multimodal=has_multimodal, is_test=True, resolution=288, label_to_stage=label_to_stage
+        )
+        test_dataset = EnhancedFinetuneDataset(
+            test_samples, transform=test_transforms, rare_classes=rare_classes,
+            has_multimodal=has_multimodal, is_test=True, resolution=288, label_to_stage=label_to_stage
+        )
 
-        # Check spectral data quality
-        if has_multimodal:
-            spectral_variance = []
-            for idx, sample in enumerate(train_samples[:100]):  # Check first 100 samples
-                spectral = sample[1]
-                if spectral is not None:
-                    spectral_variance.append(torch.var(spectral))
-            avg_spectral_variance = torch.tensor(spectral_variance).mean().item() if spectral_variance else 0.0
-            logger.info(f"Average spectral variance (first 100 samples): {avg_spectral_variance:.6f}")
-            if avg_spectral_variance < 1e-4:
-                logger.warning("Spectral data has very low variance. Disabling multimodal training.")
-                has_multimodal = False
+        # Handle class imbalance
+        stage_counts = {'early': 0, 'mid': 0, 'advanced': 0}
+        for _, _, stage in train_dataset:
+            stage_counts[stage] += 1
 
-        # Step 2: Initialize and Load HVT Model
+        class_weights = torch.tensor([
+            1.0 / stage_counts['early'],
+            1.0 / stage_counts['mid'],
+            1.0 / stage_counts['advanced']
+        ]).to(device)
+        class_weights = class_weights / class_weights.sum()
+
+        # Create weighted sampler
+        sample_weights = torch.zeros(len(train_dataset))
+        for idx, (_, _, stage) in enumerate(train_dataset):
+            sample_weights[idx] = class_weights[{'early': 0, 'mid': 1, 'advanced': 2}[stage]]
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+
+        # DataLoaders
+        train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, 
+                                num_workers=8, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, 
+                               num_workers=8, pin_memory=True)
+        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, 
+                                num_workers=8, pin_memory=True)
+
+        # Initialize model
         hvt_model = HierarchicalVisionTransformer(
             num_classes=num_classes,
             img_size=288,
             patch_sizes=[16, 8, 4],
             embed_dims=[768, 384, 192],
-            num_heads=8,
-            num_layers=16,
+            num_heads=12,
+            num_layers=12,
+            mlp_ratio=4.0,
             has_multimodal=has_multimodal,
-            dropout=0.5
+            dropout=0.1
         ).to(device)
-        
-        if os.path.exists(HVT_CHECKPOINT_PATH):
-            state_dict = torch.load(HVT_CHECKPOINT_PATH, map_location=device)
-            hvt_model.load_state_dict(state_dict, strict=True)
-            logger.info("Loaded pretrained HVT weights")
-        else:
-            logger.warning("HVT checkpoint not found, initializing new model")
 
-        # Step 3: Initialize SSL Model and Load Pretrained Weights
+        if os.path.exists(HVT_CHECKPOINT_PATH):
+            hvt_model.load_state_dict(torch.load(HVT_CHECKPOINT_PATH, map_location=device))
+            logger.info("Loaded pretrained HVT weights")
+
         ssl_model = SSLHierarchicalVisionTransformer(hvt_model, num_classes=3).to(device)
         if os.path.exists(SSL_CHECKPOINT_PATH):
-            state_dict = torch.load(SSL_CHECKPOINT_PATH, map_location=device)
-            ssl_model.load_state_dict(state_dict, strict=True)
+            ssl_model.load_state_dict(torch.load(SSL_CHECKPOINT_PATH, map_location=device))
             logger.info("Loaded SSL pretrained weights")
-        else:
-            logger.error("SSL checkpoint not found!")
-            raise FileNotFoundError("SSL checkpoint not found!")
 
-        for param in ssl_model.parameters():
-            param.requires_grad = True
-
-        # Step 4: Train at Native Resolution (288x288)
-        logger.info("Training at resolution 288x288...")
-        train_transforms, rare_transforms, test_transforms = get_transforms()
-        finetune_train_dataset = FinetuneCottonLeafDataset(
-            train_samples,
-            transform=train_transforms,
-            rare_transform=rare_transforms,
-            rare_classes=rare_classes,
-            has_multimodal=has_multimodal,
-            is_test=False,
-            resolution=288,
-            label_to_stage=label_to_stage
+        # Loss functions and optimizer
+        criterion = EnhancedFocalLoss(gamma=1.5, alpha=class_weights, label_smoothing=0.15)
+        consistency_criterion = CrossModalConsistencyLoss(temperature=0.1)
+        
+        optimizer = optim.AdamW(
+            ssl_model.parameters(),
+            lr=3e-5,
+            weight_decay=0.05,
+            betas=(0.9, 0.999)
         )
-        finetune_val_dataset = FinetuneCottonLeafDataset(
-            val_samples,
-            transform=train_transforms,
-            rare_transform=rare_transforms,
-            rare_classes=rare_classes,
-            has_multimodal=has_multimodal,
-            is_test=False,
-            resolution=288,
-            label_to_stage=label_to_stage
-        )
-        finetune_test_dataset = FinetuneCottonLeafDataset(
-            test_samples,
-            transform=test_transforms,
-            rare_transform=rare_transforms,
-            rare_classes=rare_classes,
-            has_multimodal=has_multimodal,
-            is_test=True,
-            resolution=288,
-            label_to_stage=label_to_stage
+        
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=5e-4,
+            steps_per_epoch=len(train_loader),
+            epochs=50,
+            pct_start=0.3,
+            anneal_strategy='cos',
+            final_div_factor=10000
         )
 
-        # Log class distribution using explicit indices
-        stages = []
-        for idx in range(len(finetune_train_dataset)):
-            try:
-                _, _, stage = finetune_train_dataset[idx]
-                stages.append(stage)
-            except Exception as e:
-                logger.warning(f"Error accessing finetune_train_dataset[{idx}]: {e}")
-                continue
-        stage_counts = {s: stages.count(s) for s in ['early', 'mid', 'advanced']}
-        logger.info(f"Training set stage distribution (after dataset creation): {stage_counts}")
-
-        train_loader = DataLoader(finetune_train_dataset, batch_size=16, shuffle=True, num_workers=16, pin_memory=True)
-        val_loader = DataLoader(finetune_val_dataset, batch_size=16, shuffle=False, num_workers=16, pin_memory=True)
-        test_loader = DataLoader(finetune_test_dataset, batch_size=16, shuffle=False, num_workers=16, pin_memory=True)
-        logger.info("DataLoaders created")
-
-        # Compute class weights based on training set distribution
-        stage_counts = {'early': stage_counts['early'], 'mid': stage_counts['mid'], 'advanced': stage_counts['advanced']}
-        total_samples = sum(stage_counts.values())
-        class_weights = torch.tensor([
-            (total_samples / (3 * stage_counts['early'])),
-            (total_samples / (3 * stage_counts['mid'])),
-            (total_samples / (3 * stage_counts['advanced']))
-        ]).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        consistency_criterion = CrossModalConsistencyLoss()
-        optimizer = optim.AdamW(ssl_model.parameters(), lr=1e-4, weight_decay=0.1)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
-        logger.info("Optimizer, loss functions, and scheduler initialized")
-
+        # Training
         best_model_path = train_finetune_model(
-            ssl_model, train_loader, val_loader, 
-            criterion, consistency_criterion, optimizer, scheduler, num_epochs=30, device=device,
-            train_mean=train_mean, train_std=train_std
+            ssl_model, train_loader, val_loader, criterion, consistency_criterion,
+            optimizer, scheduler, num_epochs=50, device=device,
+            train_mean=train_mean, train_std=train_std, class_names=class_names
         )
 
-        # Step 5: Load Best Model for Final Evaluation
+        # Evaluation
         ssl_model.load_state_dict(torch.load(best_model_path, map_location=device))
-        logger.info("Loaded best fine-tuned model for evaluation")
-
-        # Step 6: Evaluate on Test Set with Robustness Tests
-        class_names = ['early', 'mid', 'advanced']
-        logger.info("Evaluating on test set with robustness tests...")
-        test_loss, test_accuracy, test_f1, cm, uncertainties = evaluate_model(
-            ssl_model, test_loader, criterion, device, train_mean, train_std, class_names, robustness_tests=True
+        test_loss, test_acc, test_f1, _, test_cm = validate(
+            ssl_model, test_loader, criterion, device, train_mean, train_std, class_names
         )
-
-        # Step 7: Baseline Comparisons
-        logger.info("Evaluating baseline models...")
-        baseline_results = evaluate_baselines(test_loader, device, train_mean, train_std)
-
-        # Step 8: Ablation Study
-        logger.info("Conducting ablation study...")
-        ablation_results = ablation_study(ssl_model, test_loader, criterion, device, train_mean, train_std, class_names)
-
-        # Step 9: Computational Efficiency Analysis
-        logger.info("Computing computational efficiency...")
-        macs, params = get_model_complexity_info(ssl_model, (3, 288, 288), as_strings=True, print_per_layer_stat=False, verbose=False)
-        logger.info(f"Computational Complexity: {macs} MACs, {params} parameters")
-
-        # Step 10: Grad-CAM Visualization
-        logger.info("Generating Grad-CAM visualizations...")
-        ssl_model.eval()
-        with torch.no_grad():
-            for i, (images, spectral, stage) in enumerate(test_loader):
-                if i >= 5:
-                    break
-                images = images.to(device)
-                stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
-                grad_cam_map = grad_cam(ssl_model, images, target_class=stage[0].item(), device=device)
-                img = images[0].cpu().permute(1, 2, 0).numpy()
-                heatmap = grad_cam_map[0].cpu().squeeze().numpy()
-                plt.figure(figsize=(8, 6))
-                plt.imshow(img)
-                plt.imshow(heatmap, cmap='jet', alpha=0.5)
-                plt.title(f"Grad-CAM (Class: {class_names[stage[0].item()]})")
-                plt.savefig(f"./phase4_checkpoints/gradcam_sample_{i}.png")
-                plt.close()
-
-        # Step 11: Save Final Model and Results
+        
+        logger.info(f"Final Test Results - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}")
+        
+        # Save final model
         final_model_path = os.path.join(PHASE4_SAVE_PATH, "finetuned_final.pth")
         torch.save({
             'model_state_dict': ssl_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'test_loss': test_loss,
-            'test_accuracy': test_accuracy,
-            'test_f1': test_f1,
-            'confusion_matrix': cm,
-            'uncertainties': uncertainties,
-            'baseline_results': baseline_results,
-            'ablation_results': ablation_results,
+            'test_metrics': {
+                'loss': test_loss,
+                'accuracy': test_acc,
+                'f1_score': test_f1,
+                'confusion_matrix': test_cm
+            },
             'class_names': class_names
         }, final_model_path)
-        logger.info(f"Final model and results saved to {final_model_path}")
-
-        logger.info("Phase 4 completed successfully!")
+        
+        logger.info("Training completed successfully!")
 
     except Exception as e:
-        logger.error(f"Error in Phase 4: {e}")
+        logger.error(f"Error in training: {e}")
         raise
+
+if __name__ == "__main__":
+    main()
