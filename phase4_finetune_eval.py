@@ -1,4 +1,4 @@
-from hvt_model import HierarchicalVisionTransformer, SSLHierarchicalVisionTransformer
+# phase4_finetune_eval.py
 import os
 import torch
 import torch.nn as nn
@@ -6,19 +6,25 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
-from torchvision import transforms, models
+from torchvision import transforms
 import torchvision.transforms.functional as TF
 import numpy as np
 import logging
 import time
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy import stats
 from copy import deepcopy
 import cv2
-from ptflops import get_model_complexity_info
+from torchvision.transforms import autoaugment, RandAugment
+
+# Set environment variable to reduce memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Updated import statement to use SwinTransformer
+from hvt_model import SwinTransformer, SSLHierarchicalVisionTransformer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,7 +41,7 @@ logger.info(f"Using device: {device}")
 
 class EnhancedFinetuneDataset(Dataset):
     def __init__(self, samples, transform=None, rare_transform=None, rare_classes=None, 
-                 has_multimodal=False, is_test=False, resolution=288, label_to_stage=None):
+                 has_multimodal=False, is_test=False, resolution=224, label_to_stage=None):
         self.transform = transform
         self.rare_transform = rare_transform
         self.rare_classes = rare_classes or []
@@ -89,12 +95,22 @@ class EnhancedFinetuneDataset(Dataset):
         self.augmentation = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=30),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
-            transforms.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.8, 1.0)),
-            transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+            transforms.RandomRotation(degrees=45),
+            RandAugment(num_ops=2, magnitude=9),
+            autoaugment.AutoAugment(policy=autoaugment.AutoAugmentPolicy.IMAGENET),
+            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.4, hue=0.2),
+            transforms.RandomResizedCrop(size=(self.resolution, self.resolution), scale=(0.7, 1.0)),
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+            transforms.RandomAdjustSharpness(sharpness_factor=3, p=0.5),
+        ])
+
+        self.spectral_augmentation = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=45),
+            transforms.RandomAffine(degrees=0, scale=(0.9, 1.1)),
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
-            transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.5),
         ])
 
     def __len__(self):
@@ -138,11 +154,17 @@ class EnhancedFinetuneDataset(Dataset):
                 spectral = spectral.unsqueeze(0)
             spectral = transforms.Resize((self.resolution, self.resolution))(spectral)
             spectral = spectral[:1, :, :]  # Ensure 1 channel
+            if not self.is_test:
+                spectral = self.spectral_augmentation(spectral)
+                # Add noise to spectral data
+                noise = torch.randn_like(spectral) * 0.05
+                spectral = spectral + noise
+                spectral = torch.clamp(spectral, 0, 1)
 
         return img, spectral, stage
 
 class EnhancedFocalLoss(nn.Module):
-    def __init__(self, gamma=1.5, alpha=None, label_smoothing=0.15, reduction='mean'):
+    def __init__(self, gamma=1.5, alpha=None, label_smoothing=0.2, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
@@ -170,7 +192,7 @@ class EnhancedFocalLoss(nn.Module):
         return focal_loss
 
 class CrossModalConsistencyLoss(nn.Module):
-    def __init__(self, temperature=0.1):
+    def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
         
@@ -213,13 +235,20 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer, 
-               scheduler, scaler, device, train_mean, train_std, ema_model=None):
+                scheduler, scaler, device, train_mean, train_std, ema_model=None, 
+                accum_steps=4, epoch=None, total_epochs=None):
     model.train()
     running_loss = 0.0
     running_consistency_loss = 0.0
     correct = 0
     total = 0
-    
+    optimizer.zero_grad()
+
+    # Dynamic gamma for focal loss
+    if epoch is not None and total_epochs is not None:
+        progress = epoch / total_epochs
+        criterion.gamma = 1.5 + 1.5 * progress  # Increase gamma from 1.5 to 3.0 over training
+
     for batch_idx, (images, spectral, stage) in enumerate(train_loader):
         images = images.to(device)
         spectral = spectral.to(device) if spectral is not None else None
@@ -228,31 +257,34 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
         if images.min() >= 0 and images.max() <= 1:
             images = (images - train_mean) / train_std
 
-        optimizer.zero_grad()
-        
         with autocast():
-            # Apply MixUp or CutMix
-            if np.random.rand() < 0.5:
-                images, stage_a, stage_b, lam = mixup_data(images, stage, alpha=1.0, device=device)
+            # Apply Mixup or CutMix with higher probability
+            if np.random.rand() < 0.7:  # Increased from 0.5 to 0.7
+                if np.random.rand() < 0.5:
+                    images, stage_a, stage_b, lam = mixup_data(images, stage, alpha=1.2, device=device)
+                else:
+                    images, stage_a, stage_b, lam = cutmix_data(images, stage, alpha=1.2)
             else:
-                images, stage_a, stage_b, lam = cutmix_data(images, stage, alpha=1.0)
+                stage_a, stage_b, lam = stage, stage, 1.0
             
             _, rgb_logits = model(images, spectral)
             _, spectral_logits = model(images, None) if spectral is not None else (None, rgb_logits)
             
             class_loss = lam * criterion(rgb_logits, stage_a) + (1 - lam) * criterion(rgb_logits, stage_b)
             consistency_loss = consistency_criterion(rgb_logits, spectral_logits) if spectral is not None else 0.0
-            total_loss = class_loss + 0.5 * consistency_loss
+            total_loss = (class_loss + 0.5 * consistency_loss) / accum_steps
 
         scaler.scale(total_loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        
+
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Reduced max_norm for stability
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
+
         if ema_model is not None:
             model_ema(model, ema_model)
-        
-        scheduler.step()
         
         running_loss += class_loss.item() * images.size(0)
         running_consistency_loss += consistency_loss.item() * images.size(0) if spectral is not None else 0.0
@@ -267,7 +299,7 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
     
     return epoch_loss, epoch_consistency_loss, epoch_acc
 
-def model_ema(model, ema_model, decay=0.999):
+def model_ema(model, ema_model, decay=0.995):  # Reduced decay for more aggressive averaging
     model_params = dict(model.named_parameters())
     ema_params = dict(ema_model.named_parameters())
     for name in ema_params:
@@ -288,13 +320,15 @@ def validate(model, val_loader, criterion, device, train_mean, train_std, class_
             if images.min() >= 0 and images.max() <= 1:
                 images = (images - train_mean) / train_std
 
-            # Test-time augmentation
+            # Enhanced Test-Time Augmentation
             outputs = []
-            for _ in range(3):
+            for _ in range(5):  # Increased TTA iterations
                 aug_images = transforms.Compose([
                     transforms.RandomHorizontalFlip(p=0.5),
-                    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5))
+                    transforms.RandomVerticalFlip(p=0.5),
+                    transforms.RandomRotation(degrees=30),
+                    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+                    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
                 ])(images)
                 
                 _, logits = model(aug_images, spectral)
@@ -314,8 +348,10 @@ def validate(model, val_loader, criterion, device, train_mean, train_std, class_
     cm = confusion_matrix(all_labels, all_preds)
     per_class_acc = cm.diagonal() / cm.sum(axis=1)
     per_class_acc_dict = {class_names[i]: acc for i, acc in enumerate(per_class_acc)}
+    per_class_f1 = f1_score(all_labels, all_preds, average=None)
+    per_class_f1_dict = {class_names[i]: f for i, f in enumerate(per_class_f1)}
     
-    return val_loss, val_acc, f1, per_class_acc_dict, cm
+    return val_loss, val_acc, f1, per_class_acc_dict, per_class_f1_dict, cm
 
 def train_finetune_model(model, train_loader, val_loader, criterion, consistency_criterion, 
                         optimizer, scheduler, num_epochs, device, train_mean, train_std, class_names):
@@ -336,23 +372,27 @@ def train_finetune_model(model, train_loader, val_loader, criterion, consistency
     for epoch in range(num_epochs):
         train_loss, train_cons_loss, train_acc = train_epoch(
             model, train_loader, criterion, consistency_criterion, 
-            optimizer, scheduler, scaler, device, train_mean, train_std, ema_model
+            optimizer, scheduler, scaler, device, train_mean, train_std, ema_model,
+            epoch=epoch, total_epochs=num_epochs
         )
         
         logger.info(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, "
                    f"Cons Loss: {train_cons_loss:.4f}, Acc: {train_acc:.2f}%")
         
         # Validate both regular and EMA model
-        val_loss, val_acc, val_f1, per_class_acc, cm = validate(
+        val_loss, val_acc, val_f1, per_class_acc, per_class_f1, cm = validate(
             model, val_loader, criterion, device, train_mean, train_std, class_names
         )
-        ema_val_loss, ema_val_acc, ema_val_f1, _, _ = validate(
+        ema_val_loss, ema_val_acc, ema_val_f1, ema_per_class_acc, ema_per_class_f1, ema_cm = validate(
             ema_model, val_loader, criterion, device, train_mean, train_std, class_names
         )
         
         logger.info(f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
         logger.info(f"EMA Validation - Loss: {ema_val_loss:.4f}, Acc: {ema_val_acc:.4f}, F1: {ema_val_f1:.4f}")
         logger.info(f"Per-class accuracy: {per_class_acc}")
+        logger.info(f"Per-class F1: {per_class_f1}")
+        logger.info(f"EMA Per-class accuracy: {ema_per_class_acc}")
+        logger.info(f"EMA Per-class F1: {ema_per_class_f1}")
         
         # Save best model (regular or EMA)
         if val_acc > best_val_acc:
@@ -377,8 +417,44 @@ def train_finetune_model(model, train_loader, val_loader, criterion, consistency
 
     return best_model_path
 
+def load_model_weights(model, checkpoint_path, strict=False, ignore_keys=None):
+    """Helper function to load model weights with flexibility"""
+    ignore_keys = ignore_keys or []
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model_dict = model.state_dict()
+        
+        # Filter out ignored keys and mismatched shapes
+        pretrained_dict = {}
+        for k, v in checkpoint.items():
+            if k in ignore_keys:
+                continue
+            if k in model_dict:
+                if v.shape == model_dict[k].shape:
+                    pretrained_dict[k] = v
+                else:
+                    logger.warning(f"Shape mismatch for {k}: checkpoint shape {v.shape}, model shape {model_dict[k].shape}")
+        
+        # Update the model's state dict
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict, strict=strict)
+        
+        if strict:
+            logger.info(f"Loaded weights from {checkpoint_path} (strict mode)")
+        else:
+            missing = set(model_dict.keys()) - set(pretrained_dict.keys())
+            unexpected = set(checkpoint.keys()) - set(model_dict.keys())
+            logger.info(f"Loaded weights from {checkpoint_path}")
+            logger.info(f"Missing keys: {missing}")
+            logger.info(f"Unexpected keys: {unexpected}")
+    else:
+        logger.warning(f"Checkpoint not found at {checkpoint_path}")
+
 def main():
     try:
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+
         # Configuration
         PHASE1_CHECKPOINT_PATH = "./phase1_checkpoints/phase1_preprocessed_data.pth"
         HVT_CHECKPOINT_PATH = "./phase2_checkpoints/HVT_best.pth"
@@ -438,15 +514,15 @@ def main():
 
         train_dataset = EnhancedFinetuneDataset(
             train_samples, transform=train_transforms, rare_classes=rare_classes,
-            has_multimodal=has_multimodal, resolution=288, label_to_stage=label_to_stage
+            has_multimodal=has_multimodal, resolution=224, label_to_stage=label_to_stage
         )
         val_dataset = EnhancedFinetuneDataset(
             val_samples, transform=train_transforms, rare_classes=rare_classes,
-            has_multimodal=has_multimodal, is_test=True, resolution=288, label_to_stage=label_to_stage
+            has_multimodal=has_multimodal, is_test=True, resolution=224, label_to_stage=label_to_stage
         )
         test_dataset = EnhancedFinetuneDataset(
             test_samples, transform=test_transforms, rare_classes=rare_classes,
-            has_multimodal=has_multimodal, is_test=True, resolution=288, label_to_stage=label_to_stage
+            has_multimodal=has_multimodal, is_test=True, resolution=224, label_to_stage=label_to_stage
         )
 
         # Handle class imbalance
@@ -467,55 +543,77 @@ def main():
             sample_weights[idx] = class_weights[{'early': 0, 'mid': 1, 'advanced': 2}[stage]]
         sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
 
-        # DataLoaders
-        train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, 
+        # DataLoaders with reduced batch size
+        batch_size = 8
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, 
                                 num_workers=8, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, 
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
                                num_workers=8, pin_memory=True)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, 
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
                                 num_workers=8, pin_memory=True)
 
         # Initialize model
-        hvt_model = HierarchicalVisionTransformer(
-            num_classes=num_classes,
-            img_size=288,
-            patch_sizes=[16, 8, 4],
-            embed_dims=[768, 384, 192],
-            num_heads=12,
-            num_layers=12,
-            mlp_ratio=4.0,
-            has_multimodal=has_multimodal,
-            dropout=0.1
+        hvt_model = SwinTransformer(
+            num_classes=7,  # Match the checkpoint's num_classes
+            img_size=224,
+            patch_size=4,
+            embed_dim=96,
+            depths=[2, 2, 6, 2],
+            num_heads=[3, 6, 12, 24],
+            window_size=7,
+            drop_rate=0.1,
+            drop_path_rate=0.2,
+            has_multimodal=has_multimodal
         ).to(device)
 
-        if os.path.exists(HVT_CHECKPOINT_PATH):
-            hvt_model.load_state_dict(torch.load(HVT_CHECKPOINT_PATH, map_location=device))
-            logger.info("Loaded pretrained HVT weights")
+        # Load pretrained weights with flexible loading
+        load_model_weights(hvt_model, HVT_CHECKPOINT_PATH, strict=False)
 
+        # Reinitialize the head for the new number of classes
+        hvt_model.head = nn.Linear(hvt_model.num_features, num_classes).to(device)
+
+        # Initialize SSL model
         ssl_model = SSLHierarchicalVisionTransformer(hvt_model, num_classes=3).to(device)
-        if os.path.exists(SSL_CHECKPOINT_PATH):
-            ssl_model.load_state_dict(torch.load(SSL_CHECKPOINT_PATH, map_location=device))
-            logger.info("Loaded SSL pretrained weights")
+
+        # Load SSL checkpoint, ignoring mismatched keys
+        ignore_keys = [
+            'base_model.head.weight', 'base_model.head.bias',
+            'projection_head.0.weight', 'projection_head.0.bias',
+            'projection_head.2.weight', 'projection_head.2.bias',
+            'classification_head.weight', 'classification_head.bias'
+        ]
+        load_model_weights(ssl_model, SSL_CHECKPOINT_PATH, strict=False, ignore_keys=ignore_keys)
+
+        # Reinitialize the projection_head and classification_head
+        final_embed_dim = ssl_model.base_model.num_features
+        ssl_model.projection_head = nn.Sequential(
+            nn.Linear(final_embed_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 128)
+        ).to(device)
+        ssl_model.classification_head = nn.Linear(final_embed_dim, num_classes).to(device)
+
+        # Log the shapes of the projection head to verify
+        logger.info(f"Projection head shapes:")
+        for name, param in ssl_model.projection_head.named_parameters():
+            logger.info(f"{name}: {param.shape}")
 
         # Loss functions and optimizer
-        criterion = EnhancedFocalLoss(gamma=1.5, alpha=class_weights, label_smoothing=0.15)
-        consistency_criterion = CrossModalConsistencyLoss(temperature=0.1)
+        criterion = EnhancedFocalLoss(gamma=1.5, alpha=class_weights, label_smoothing=0.2)
+        consistency_criterion = CrossModalConsistencyLoss(temperature=0.07)
         
         optimizer = optim.AdamW(
             ssl_model.parameters(),
-            lr=3e-5,
-            weight_decay=0.05,
+            lr=1e-4,  # Lowered initial LR for stability
+            weight_decay=0.1,  # Increased weight decay
             betas=(0.9, 0.999)
         )
         
-        scheduler = optim.lr_scheduler.OneCycleLR(
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            max_lr=5e-4,
-            steps_per_epoch=len(train_loader),
-            epochs=50,
-            pct_start=0.3,
-            anneal_strategy='cos',
-            final_div_factor=10000
+            T_0=10,  # First cycle length
+            T_mult=2,  # Double the cycle length after each restart
+            eta_min=1e-6  # Minimum learning rate
         )
 
         # Training
@@ -527,12 +625,23 @@ def main():
 
         # Evaluation
         ssl_model.load_state_dict(torch.load(best_model_path, map_location=device))
-        test_loss, test_acc, test_f1, _, test_cm = validate(
+        test_loss, test_acc, test_f1, per_class_acc, per_class_f1, test_cm = validate(
             ssl_model, test_loader, criterion, device, train_mean, train_std, class_names
         )
         
         logger.info(f"Final Test Results - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, F1: {test_f1:.4f}")
-        
+        logger.info(f"Test Per-class accuracy: {per_class_acc}")
+        logger.info(f"Test Per-class F1: {per_class_f1}")
+
+        # Visualize confusion matrix
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(test_cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix')
+        plt.savefig(os.path.join(PHASE4_SAVE_PATH, 'confusion_matrix.png'))
+        plt.close()
+
         # Save final model
         final_model_path = os.path.join(PHASE4_SAVE_PATH, "finetuned_final.pth")
         torch.save({
@@ -542,6 +651,8 @@ def main():
                 'loss': test_loss,
                 'accuracy': test_acc,
                 'f1_score': test_f1,
+                'per_class_acc': per_class_acc,
+                'per_class_f1': per_class_f1,
                 'confusion_matrix': test_cm
             },
             'class_names': class_names
