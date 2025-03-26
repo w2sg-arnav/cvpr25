@@ -107,24 +107,48 @@ class SwinTransformerBlock(nn.Module):
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        # Adjust window size dynamically based on feature map size
+        effective_window_size = min(self.window_size, H, W)
+        effective_shift_size = min(self.shift_size, effective_window_size // 2) if self.shift_size > 0 else 0
+
+        if effective_window_size >= 2:  # Only apply window attention if feature map is large enough
+            if effective_shift_size > 0:
+                shifted_x = torch.roll(x, shifts=(-effective_shift_size, -effective_shift_size), dims=(1, 2))
+            else:
+                shifted_x = x
+
+            # Ensure divisibility by padding if necessary
+            pad_h = (effective_window_size - H % effective_window_size) % effective_window_size
+            pad_w = (effective_window_size - W % effective_window_size) % effective_window_size
+            if pad_h > 0 or pad_w > 0:
+                shifted_x = F.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
+
+            # Update H and W after padding
+            H_padded, W_padded = H + pad_h, W + pad_w
+
+            x_windows = shifted_x.view(B, H_padded // effective_window_size, effective_window_size,
+                                      W_padded // effective_window_size, effective_window_size, C)
+            x_windows = x_windows.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, effective_window_size * effective_window_size, C)
+
+            attn_mask = mask if effective_shift_size > 0 else None
+            attn_windows = self.attn(x_windows, mask=attn_mask)
+            attn_windows = attn_windows.view(-1, effective_window_size, effective_window_size, C)
+            shifted_x = attn_windows.view(B, H_padded // effective_window_size, W_padded // effective_window_size,
+                                         effective_window_size, effective_window_size, C)
+            shifted_x = shifted_x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H_padded, W_padded, C)
+
+            if effective_shift_size > 0:
+                shifted_x = torch.roll(shifted_x, shifts=(effective_shift_size, effective_shift_size), dims=(1, 2))
+
+            # Remove padding
+            if pad_h > 0 or pad_w > 0:
+                shifted_x = shifted_x[:, :H, :W, :]
+
+            x = shifted_x.view(B, H * W, C)
         else:
-            shifted_x = x
+            # If feature map is too small, skip window attention and apply MLP only
+            x = x.view(B, H * W, C)
 
-        x_windows = shifted_x.view(B, H // self.window_size, self.window_size, 
-                                  W // self.window_size, self.window_size, C)
-        x_windows = x_windows.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
-
-        attn_mask = mask if self.shift_size > 0 else None
-        attn_windows = self.attn(x_windows, mask=attn_mask)
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = attn_windows.view(B, H // self.window_size, W // self.window_size, 
-                                     self.window_size, self.window_size, C)
-        shifted_x = shifted_x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
-
-        x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2)) if self.shift_size > 0 else shifted_x
-        x = x.view(B, H * W, C)
         x = shortcut + self.drop_path(self.layer_scale1 * x)
         x = x + self.drop_path(self.layer_scale2 * self.mlp(self.norm2(x)))
 
@@ -267,3 +291,24 @@ class SSLHierarchicalVisionTransformer(nn.Module):
         ssl_projection = self.projection_head(features)
         class_logits = self.classification_head(features)
         return ssl_projection, class_logits
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SwinTransformer(
+        num_classes=3,
+        img_size=256,
+        patch_size=16,
+        embed_dim=168,  # Match your model configuration
+        depths=[2, 2, 6, 2],
+        num_heads=[3, 6, 12, 24],
+        window_size=8,
+        has_multimodal=True
+    ).to(device)
+
+    ssl_model = SSLHierarchicalVisionTransformer(model, num_classes=3).to(device)
+
+    x_rgb = torch.randn(2, 3, 256, 256).to(device)
+    x_spectral = torch.randn(2, 1, 256, 256).to(device)
+    ssl_proj, class_logits = ssl_model(x_rgb, x_spectral)
+    print(f"SSL Projection shape: {ssl_proj.shape}")
+    print(f"Classification logits shape: {class_logits.shape}")

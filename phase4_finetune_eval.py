@@ -33,7 +33,7 @@ logger.info(f"Using device: {device}")
 
 class EnhancedFinetuneDataset(Dataset):
     def __init__(self, samples, transform=None, rare_classes=None, has_multimodal=False, 
-                 is_test=False, resolution=260, label_to_stage=None):
+                 is_test=False, resolution=256, label_to_stage=None):  # Updated to 256
         self.transform = transform
         self.rare_classes = rare_classes or []
         self.has_multimodal = has_multimodal
@@ -439,15 +439,15 @@ def main():
 
         train_dataset = EnhancedFinetuneDataset(
             train_samples, transform=train_transforms, rare_classes=rare_classes,
-            has_multimodal=has_multimodal, resolution=260, label_to_stage=label_to_stage
+            has_multimodal=has_multimodal, resolution=256, label_to_stage=label_to_stage
         )
         val_dataset = EnhancedFinetuneDataset(
             val_samples, transform=train_transforms, rare_classes=rare_classes,
-            has_multimodal=has_multimodal, is_test=True, resolution=260, label_to_stage=label_to_stage
+            has_multimodal=has_multimodal, is_test=True, resolution=256, label_to_stage=label_to_stage
         )
         test_dataset = EnhancedFinetuneDataset(
             test_samples, transform=test_transforms, rare_classes=rare_classes,
-            has_multimodal=has_multimodal, is_test=True, resolution=260, label_to_stage=label_to_stage
+            has_multimodal=has_multimodal, is_test=True, resolution=256, label_to_stage=label_to_stage
         )
 
         stage_counts = {'early': 0, 'mid': 0, 'advanced': 0}
@@ -472,8 +472,8 @@ def main():
                                 num_workers=8, pin_memory=True)
 
         hvt_model = SwinTransformer(
-            num_classes=num_classes, img_size=260, patch_size=16, embed_dim=168,
-            depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=8,  # Changed to 8
+            num_classes=num_classes, img_size=256, patch_size=16, embed_dim=168,
+            depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=8,
             drop_rate=0.2, drop_path_rate=0.3, has_multimodal=has_multimodal
         ).to(device)
 
@@ -497,7 +497,7 @@ def main():
         ).to(device)
         ssl_model.classification_head = nn.Linear(final_embed_dim, num_classes).to(device)
 
-        dummy_rgb = torch.randn(2, 3, 260, 260).to(device)
+        dummy_rgb = torch.randn(2, 3, 256, 256).to(device)
         _, logits = ssl_model(dummy_rgb)
         logger.info(f"Model output shape: {logits.shape}")
 
