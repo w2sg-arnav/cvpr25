@@ -23,7 +23,6 @@ from torchvision.transforms import autoaugment, RandAugment
 # Set environment variable to reduce memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Updated import statement to use SwinTransformer
 from hvt_model import SwinTransformer, SSLHierarchicalVisionTransformer
 
 # Set up logging
@@ -92,6 +91,7 @@ class EnhancedFinetuneDataset(Dataset):
             'advanced': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.8), 1.8)
         }
 
+        # Augmentation pipeline for RGB images
         self.augmentation = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
@@ -105,6 +105,7 @@ class EnhancedFinetuneDataset(Dataset):
             transforms.RandomAdjustSharpness(sharpness_factor=3, p=0.5),
         ])
 
+        # Augmentation pipeline for spectral data
         self.spectral_augmentation = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
@@ -134,7 +135,11 @@ class EnhancedFinetuneDataset(Dataset):
         img = img[:3, :, :]  # Ensure 3 channels
 
         if not self.is_test:
+            # Convert to uint8 for augmentations that require it (e.g., AutoAugment)
+            img = (img * 255).to(torch.uint8)
             img = self.augmentation(img)
+            # Convert back to float32 and normalize to [0, 1]
+            img = img.to(torch.float32) / 255.0
             img = self.progression_stages[stage](img)
 
         if self.transform:
@@ -143,9 +148,12 @@ class EnhancedFinetuneDataset(Dataset):
                     img = t(img)
 
         if not self.is_test and label in self.rare_classes and self.rare_transform:
+            # Convert to uint8 for rare transform if needed
+            img = (img * 255).to(torch.uint8)
             for t in self.rare_transform.transforms:
                 if not isinstance(t, transforms.ToTensor):
                     img = t(img)
+            img = img.to(torch.float32) / 255.0
 
         if self.has_multimodal and spectral is not None:
             if not isinstance(spectral, torch.Tensor):
@@ -155,6 +163,7 @@ class EnhancedFinetuneDataset(Dataset):
             spectral = transforms.Resize((self.resolution, self.resolution))(spectral)
             spectral = spectral[:1, :, :]  # Ensure 1 channel
             if not self.is_test:
+                # Spectral augmentations don't require uint8, so apply directly
                 spectral = self.spectral_augmentation(spectral)
                 # Add noise to spectral data
                 noise = torch.randn_like(spectral) * 0.05
