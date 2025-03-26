@@ -16,10 +16,9 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from torchvision.transforms import autoaugment, RandAugment
+from hvt_model import SwinTransformer, SSLHierarchicalVisionTransformer
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-from hvt_model import SwinTransformer, SSLHierarchicalVisionTransformer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,8 +31,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
 
 class EnhancedFinetuneDataset(Dataset):
-    def __init__(self, samples, transform=None, rare_classes=None, has_multimodal=False, 
-                 is_test=False, resolution=256, label_to_stage=None):  # Updated to 256
+    def __init__(self, samples, transform=None, rare_classes=None, has_multimodal=False,
+                 is_test=False, resolution=256, label_to_stage=None):
         self.transform = transform
         self.rare_classes = rare_classes or []
         self.has_multimodal = has_multimodal
@@ -71,7 +70,9 @@ class EnhancedFinetuneDataset(Dataset):
             except Exception as e:
                 logger.warning(f"Skipping invalid sample: {e}")
 
-        logger.info(f"Dataset initialized with {len(self.samples)} valid samples")
+        spectral_count = sum(1 for _, s, _ in self.samples if s is not None)
+        logger.info(f"Dataset initialized with {len(self.samples)} valid samples, "
+                    f"{spectral_count} with spectral data ({spectral_count/len(self.samples)*100:.2f}%)")
 
         self.progression_stages = {
             'early': lambda x: TF.adjust_brightness(TF.adjust_contrast(x, 1.3), 1.3),
@@ -201,8 +202,8 @@ def rand_bbox(size, lam):
     bby2 = np.clip(cy + cut_h // 2, 0, H)
     return bbx1, bby1, bbx2, bby2
 
-def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer, 
-                scheduler, scaler, device, train_mean, train_std, ema_model=None, 
+def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer,
+                scheduler, scaler, device, train_mean, train_std, ema_model=None,
                 accum_steps=4, epoch=None, total_epochs=None):
     model.train()
     running_loss = 0.0
@@ -219,7 +220,7 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
         spectral = spectral.to(device) if spectral is not None else None
         stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
 
-        images = (images - train_mean) / train_std
+        images = (images - train_mean.to(device)) / train_std.to(device)
 
         with autocast():
             if np.random.rand() < 0.7:
@@ -234,7 +235,12 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
             _, spectral_logits = model(images, None) if spectral is not None else (None, rgb_logits)
 
             class_loss = lam * criterion(rgb_logits, stage_a) + (1 - lam) * criterion(rgb_logits, stage_b)
-            consistency_loss = consistency_criterion(rgb_logits, spectral_logits) if spectral is not None else 0.0
+            consistency_loss = 0.0
+            if spectral is not None and spectral_logits is not None:
+                consistency_loss = consistency_criterion(rgb_logits, spectral_logits)
+                if torch.isnan(consistency_loss):
+                    logger.warning(f"Consistency loss is nan at batch {batch_idx}")
+                    consistency_loss = 0.0
             total_loss = (class_loss + 0.5 * consistency_loss) / accum_steps
 
         scaler.scale(total_loss).backward()
@@ -250,14 +256,14 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
             model_ema(model, ema_model)
 
         running_loss += class_loss.item() * images.size(0)
-        running_cons_loss += consistency_loss.item() * images.size(0) if spectral is not None else 0.0
+        running_cons_loss += consistency_loss.item() * images.size(0) if consistency_loss != 0.0 else 0.0
         _, predicted = torch.max(rgb_logits, 1)
         total += stage.size(0)
-        correct += (lam * (predicted == stage_a).sum().item() + 
+        correct += (lam * (predicted == stage_a).sum().item() +
                    (1 - lam) * (predicted == stage_b).sum().item())
 
     epoch_loss = running_loss / len(train_loader.dataset)
-    epoch_cons_loss = running_cons_loss / len(train_loader.dataset)
+    epoch_cons_loss = running_cons_loss / len(train_loader.dataset) if running_cons_loss > 0 else float('nan')
     epoch_acc = 100 * correct / total
     return epoch_loss, epoch_cons_loss, epoch_acc
 
@@ -279,7 +285,7 @@ def validate(model, val_loader, criterion, device, train_mean, train_std, class_
             spectral = spectral.to(device) if spectral is not None else None
             stage = torch.tensor([{'early': 0, 'mid': 1, 'advanced': 2}[s] for s in stage]).to(device)
 
-            images = (images - train_mean) / train_std
+            images = (images - train_mean.to(device)) / train_std.to(device)
 
             outputs = []
             for _ in range(5):
@@ -310,14 +316,14 @@ def validate(model, val_loader, criterion, device, train_mean, train_std, class_
 
     return val_loss, val_acc, f1, per_class_acc, per_class_f1, cm
 
-def train_finetune_model(model, train_loader, val_loader, criterion, consistency_criterion, 
+def train_finetune_model(model, train_loader, val_loader, criterion, consistency_criterion,
                          optimizer, scheduler, num_epochs, device, train_mean, train_std, class_names):
     scaler = GradScaler()
     best_val_acc = 0.0
     best_model_path = "./phase4_checkpoints/finetuned_best.pth"
     os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
 
-    ema_model = deepcopy(model)
+    ema_model = deepcopy(model).to(device)
     for param in ema_model.parameters():
         param.requires_grad_(False)
 
@@ -326,7 +332,7 @@ def train_finetune_model(model, train_loader, val_loader, criterion, consistency
 
     for epoch in range(num_epochs):
         train_loss, train_cons_loss, train_acc = train_epoch(
-            model, train_loader, criterion, consistency_criterion, optimizer, scheduler, 
+            model, train_loader, criterion, consistency_criterion, optimizer, scheduler,
             scaler, device, train_mean, train_std, ema_model, epoch=epoch, total_epochs=num_epochs
         )
         logger.info(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, "
@@ -376,13 +382,17 @@ def load_model_weights(model, checkpoint_path, strict=False, ignore_keys=None):
         if k in ignore_keys or k not in model_dict:
             continue
         if v.shape == model_dict[k].shape:
-            pretrained_dict[k] = v
+            pretrained_dict[k] = v.to(device)
         else:
             logger.warning(f"Shape mismatch for {k}: checkpoint {v.shape}, model {model_dict[k].shape}")
 
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict, strict=strict)
     logger.info(f"Loaded weights from {checkpoint_path}")
+    for name, param in model.named_parameters():
+        if param.device != device:
+            logger.warning(f"Parameter {name} is on {param.device}, moving to {device}")
+            param.data = param.data.to(device)
 
 def main():
     try:
@@ -394,7 +404,7 @@ def main():
         PHASE4_SAVE_PATH = "./phase4_checkpoints"
         os.makedirs(PHASE4_SAVE_PATH, exist_ok=True)
 
-        checkpoint_data = torch.load(PHASE1_CHECKPOINT_PATH)
+        checkpoint_data = torch.load(PHASE1_CHECKPOINT_PATH, map_location=device)
         train_dataset = checkpoint_data['train_dataset']
         val_dataset = checkpoint_data['val_dataset']
         test_dataset = checkpoint_data['test_dataset']
@@ -456,32 +466,34 @@ def main():
         logger.info(f"Stage counts: {stage_counts}")
 
         class_weights = torch.tensor([1.0 / max(stage_counts[c], 1) for c in class_names]).to(device)
-        class_weights = class_weights * torch.tensor([2.0, 2.0, 1.0]).to(device)
+        class_weights = class_weights * torch.tensor([3.0, 1.5, 3.0]).to(device)  # Boost early and advanced
         class_weights = class_weights / class_weights.sum()
+        logger.info(f"Class weights: {class_weights.tolist()}")
 
-        sample_weights = torch.tensor([class_weights[{'early': 0, 'mid': 1, 'advanced': 2}[s]] 
-                                     for _, _, s in train_dataset])
+        sample_weights = torch.tensor([class_weights[{'early': 0, 'mid': 1, 'advanced': 2}[s]]
+                                     for _, _, s in train_dataset]).to(device)
         sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
 
         batch_size = 8
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, 
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler,
                                  num_workers=8, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                num_workers=8, pin_memory=True)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                 num_workers=8, pin_memory=True)
 
         hvt_model = SwinTransformer(
             num_classes=num_classes, img_size=256, patch_size=16, embed_dim=168,
             depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=8,
-            drop_rate=0.2, drop_path_rate=0.3, has_multimodal=has_multimodal
-        ).to(device)
+            drop_rate=0.2, drop_path_rate=0.3, has_multimodal=has_multimodal,
+            device=device
+        )
 
-        load_model_weights(hvt_model, HVT_CHECKPOINT_PATH, strict=False, 
+        load_model_weights(hvt_model, HVT_CHECKPOINT_PATH, strict=False,
                           ignore_keys=['head.weight', 'head.bias'])
         hvt_model.head = nn.Linear(hvt_model.num_features, num_classes).to(device)
 
-        ssl_model = SSLHierarchicalVisionTransformer(hvt_model, num_classes=num_classes).to(device)
+        ssl_model = SSLHierarchicalVisionTransformer(hvt_model, num_classes=num_classes, device=device)
         load_model_weights(ssl_model, SSL_CHECKPOINT_PATH, strict=False, ignore_keys=[
             'base_model.head.weight', 'base_model.head.bias',
             'classification_head.weight', 'classification_head.bias',
@@ -492,7 +504,8 @@ def main():
         final_embed_dim = ssl_model.base_model.num_features
         ssl_model.projection_head = nn.Sequential(
             nn.Linear(final_embed_dim, 1024),
-            nn.ReLU(),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(inplace=True),
             nn.Linear(1024, 128)
         ).to(device)
         ssl_model.classification_head = nn.Linear(final_embed_dim, num_classes).to(device)
