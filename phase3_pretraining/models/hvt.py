@@ -1,9 +1,10 @@
-# models/hvt.py
+# phase3_pretraining/models/hvt.py
 import torch
 import torch.nn as nn
 import math
 from typing import List, Tuple
 from .dfca import DiseaseFocusedCrossAttention
+from .projection_head import ProjectionHead
 from config import PATCH_SIZE, EMBED_DIM, DEPTHS, NUM_HEADS, WINDOW_SIZE, NUM_CLASSES, SPECTRAL_CHANNELS
 import logging
 
@@ -92,6 +93,7 @@ class DiseaseAwareHVT(nn.Module):
         super().__init__()
         self.img_size = img_size
         self.num_stages = len(depths)
+        self.embed_dim = embed_dim  # Store initial embed_dim for projection head
         
         # Patch embedding for RGB and spectral
         self.rgb_patch_embed = PatchEmbed(img_size, patch_size, 3, embed_dim)
@@ -103,33 +105,38 @@ class DiseaseAwareHVT(nn.Module):
         
         # Transformer stages
         self.stages = nn.ModuleList()
+        current_embed_dim = embed_dim
         for i in range(self.num_stages):
             stage = nn.ModuleList([
-                SwinTransformerBlock(embed_dim, num_heads[i], window_size)
+                SwinTransformerBlock(current_embed_dim, num_heads[i], window_size)
                 for _ in range(depths[i])
             ])
             self.stages.append(stage)
             
             # Patch merging after each stage (except the last)
             if i < self.num_stages - 1:
-                embed_dim *= 2
-                self.stages.append(nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=2, stride=2))
+                current_embed_dim *= 2
+                self.stages.append(nn.Conv2d(current_embed_dim // 2, current_embed_dim, kernel_size=2, stride=2))
         
         # Disease-Focused Cross-Attention for multi-modal fusion
-        self.dfca = DiseaseFocusedCrossAttention(embed_dim, num_heads[-1])
+        self.dfca = DiseaseFocusedCrossAttention(current_embed_dim, num_heads[-1])
         
-        # Classification head
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
+        # Normalization and classification head (for fine-tuning)
+        self.norm = nn.LayerNorm(current_embed_dim)
+        self.head = nn.Linear(current_embed_dim, num_classes)
+        
+        # Projection head for pretraining
+        self.projection_head = ProjectionHead(current_embed_dim)
     
-    def forward(self, rgb: torch.Tensor, spectral: torch.Tensor) -> torch.Tensor:
+    def forward(self, rgb: torch.Tensor, spectral: torch.Tensor, pretrain: bool = False) -> torch.Tensor:
         """
         Args:
             rgb (torch.Tensor): RGB input [batch, 3, H, W].
             spectral (torch.Tensor): Spectral input [batch, spectral_channels, H, W].
+            pretrain (bool): If True, return features for pretraining; if False, return logits for classification.
         
         Returns:
-            torch.Tensor: Class logits [batch, num_classes].
+            torch.Tensor: Features for pretraining or logits for classification.
         """
         # Patch embedding
         rgb = self.rgb_patch_embed(rgb) + self.pos_embed_rgb
@@ -158,7 +165,12 @@ class DiseaseAwareHVT(nn.Module):
         # Multi-modal fusion with DFCA
         fused_features = self.dfca(rgb, spectral)
         
-        # Classification
-        fused_features = self.norm(fused_features.mean(dim=1))  # Global average pooling
-        logits = self.head(fused_features)
-        return logits
+        if pretrain:
+            # For pretraining: return features after projection head
+            features = self.norm(fused_features.mean(dim=1))  # Global average pooling
+            return self.projection_head(features)
+        else:
+            # For fine-tuning: return logits
+            fused_features = self.norm(fused_features.mean(dim=1))  # Global average pooling
+            logits = self.head(fused_features)
+            return logits
