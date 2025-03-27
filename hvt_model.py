@@ -269,6 +269,55 @@ class SwinTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    def adapt_pos_embed(self, checkpoint_pos_embed, target_num_patches, target_embed_dim):
+        """Adapt positional embeddings from checkpoint to current model size."""
+        old_num_patches, old_embed_dim = checkpoint_pos_embed.shape[1], checkpoint_pos_embed.shape[2]
+        new_grid_size = int(target_num_patches ** 0.5)
+        
+        # Check if checkpoint includes a class token
+        old_grid_size = int((old_num_patches - 1) ** 0.5) if old_num_patches != (int(old_num_patches ** 0.5) ** 2) else int(old_num_patches ** 0.5)
+        has_cls_token = (old_num_patches != old_grid_size * old_grid_size)
+        
+        if has_cls_token:
+            cls_token = checkpoint_pos_embed[:, :1, :]  # Extract class token
+            spatial_embed = checkpoint_pos_embed[:, 1:, :]  # Spatial embeddings
+            spatial_size = old_num_patches - 1
+        else:
+            cls_token = None
+            spatial_embed = checkpoint_pos_embed
+            spatial_size = old_num_patches
+
+        # Reshape spatial embeddings to grid
+        if spatial_size != old_grid_size * old_grid_size:
+            raise ValueError(f"Cannot reshape {spatial_size} patches into a square grid (got {old_grid_size}x{old_grid_size})")
+        
+        spatial_embed = spatial_embed.view(1, old_grid_size, old_grid_size, old_embed_dim)
+        
+        # Interpolate to target grid size
+        spatial_embed = F.interpolate(
+            spatial_embed.permute(0, 3, 1, 2),
+            size=(new_grid_size, new_grid_size),
+            mode='bicubic',
+            align_corners=False
+        ).permute(0, 2, 3, 1)
+        
+        # Adjust embedding dimension if needed
+        if old_embed_dim != target_embed_dim:
+            spatial_embed = spatial_embed.view(1, target_num_patches, old_embed_dim)
+            proj = nn.Linear(old_embed_dim, target_embed_dim).to(spatial_embed.device)
+            spatial_embed = proj(spatial_embed)
+        
+        # Reattach class token if present
+        if has_cls_token:
+            if old_embed_dim != target_embed_dim:
+                cls_proj = nn.Linear(old_embed_dim, target_embed_dim).to(cls_token.device)
+                cls_token = cls_proj(cls_token)
+            adapted_pos_embed = torch.cat([cls_token, spatial_embed.view(1, target_num_patches, target_embed_dim)], dim=1)
+        else:
+            adapted_pos_embed = spatial_embed.view(1, target_num_patches, target_embed_dim)
+        
+        return adapted_pos_embed
+
     def forward_features(self, x, is_spectral=False):
         x = self.spectral_patch_embed(x) if is_spectral else self.patch_embed(x)
         pos_embed = self.spectral_pos_embed if is_spectral else self.pos_embed

@@ -168,7 +168,11 @@ class CrossModalConsistencyLoss(nn.Module):
     def forward(self, rgb_logits, spectral_logits):
         rgb_probs = F.softmax(rgb_logits / self.temperature, dim=1)
         spectral_probs = F.softmax(spectral_logits / self.temperature, dim=1)
-        return F.kl_div(rgb_probs.log(), spectral_probs, reduction='batchmean')
+        # Add small epsilon to avoid log(0)
+        rgb_probs = rgb_probs + 1e-8
+        spectral_probs = spectral_probs + 1e-8
+        kl_div = F.kl_div(rgb_probs.log(), spectral_probs, reduction='batchmean')
+        return torch.clamp(kl_div, max=100.0)  # Cap to prevent explosion
 
 def mixup_data(x, y, alpha=1.0, device='cuda'):
     if alpha > 0:
@@ -238,9 +242,9 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
             consistency_loss = 0.0
             if spectral is not None and spectral_logits is not None:
                 consistency_loss = consistency_criterion(rgb_logits, spectral_logits)
-                if torch.isnan(consistency_loss):
-                    logger.warning(f"Consistency loss is nan at batch {batch_idx}")
-                    consistency_loss = 0.0
+                if torch.isnan(consistency_loss) or torch.isinf(consistency_loss):
+                    logger.warning(f"Consistency loss is invalid at batch {batch_idx}: {consistency_loss}")
+                    consistency_loss = torch.tensor(0.0, device=device)
             total_loss = (class_loss + 0.5 * consistency_loss) / accum_steps
 
         scaler.scale(total_loss).backward()
@@ -263,7 +267,7 @@ def train_epoch(model, train_loader, criterion, consistency_criterion, optimizer
                    (1 - lam) * (predicted == stage_b).sum().item())
 
     epoch_loss = running_loss / len(train_loader.dataset)
-    epoch_cons_loss = running_cons_loss / len(train_loader.dataset) if running_cons_loss > 0 else float('nan')
+    epoch_cons_loss = running_cons_loss / len(train_loader.dataset) if running_cons_loss > 0 else 0.0
     epoch_acc = 100 * correct / total
     return epoch_loss, epoch_cons_loss, epoch_acc
 
@@ -381,6 +385,8 @@ def load_model_weights(model, checkpoint_path, strict=False, ignore_keys=None):
     for k, v in checkpoint.items():
         if k in ignore_keys or k not in model_dict:
             continue
+        if k in ['pos_embed', 'spectral_pos_embed'] and isinstance(model, SwinTransformer):
+            v = model.adapt_pos_embed(v, model_dict[k].shape[1], model_dict[k].shape[2])
         if v.shape == model_dict[k].shape:
             pretrained_dict[k] = v.to(device)
         else:
@@ -389,6 +395,8 @@ def load_model_weights(model, checkpoint_path, strict=False, ignore_keys=None):
     model_dict.update(pretrained_dict)
     model.load_state_dict(model_dict, strict=strict)
     logger.info(f"Loaded weights from {checkpoint_path}")
+
+    # Only log and move if device is actually different
     for name, param in model.named_parameters():
         if param.device != device:
             logger.warning(f"Parameter {name} is on {param.device}, moving to {device}")
