@@ -14,11 +14,13 @@ logging.info(f"sys.path: {sys.path}")
 
 # Now perform imports
 import torch
+from torch.utils.data import DataLoader
 from config import PROGRESSIVE_RESOLUTIONS, FINETUNE_BATCH_SIZE, PRETRAINED_MODEL_PATH, NUM_CLASSES
 from models.hvt import DiseaseAwareHVT
 from models.baseline import InceptionV3Baseline
 from utils.augmentations import FinetuneAugmentation
 from finetune.trainer import Finetuner
+from dataset import SARCLD2024Dataset
 
 def main():
     # Device configuration
@@ -28,13 +30,42 @@ def main():
     # Use the largest resolution for fine-tuning
     img_size = PROGRESSIVE_RESOLUTIONS[-1]  # (384, 384)
     
-    # Initialize models
+    # Load dataset
+    dataset_root = "/teamspace/studios/this_studio/cvpr25/SAR-CLD-2024 A Comprehensive Dataset for Cotton Leaf Disease Detection"
+    # Verify dataset_root exists
+    if not os.path.exists(dataset_root):
+        raise FileNotFoundError(f"Dataset root directory does not exist: {dataset_root}. Please check the path.")
+    
+    train_dataset = SARCLD2024Dataset(dataset_root, img_size, split="train", train_split=0.8)
+    val_dataset = SARCLD2024Dataset(dataset_root, img_size, split="val", train_split=0.8)
+    train_loader = DataLoader(train_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=FINETUNE_BATCH_SIZE, shuffle=False)
+    
+    # Log dataset sizes
+    logging.info(f"Training dataset size: {len(train_dataset)} samples")
+    logging.info(f"Validation dataset size: {len(val_dataset)} samples")
+    
+    # Update NUM_CLASSES in config based on dataset
+    num_classes = len(train_dataset.get_class_names())
+    if num_classes != NUM_CLASSES:
+        logging.warning(f"NUM_CLASSES in config ({NUM_CLASSES}) does not match dataset classes ({num_classes}). Updating NUM_CLASSES.")
+        globals()['NUM_CLASSES'] = num_classes
+    
+    # Initialize models AFTER updating NUM_CLASSES
     hvt_model = DiseaseAwareHVT(img_size=img_size)
     baseline_model = InceptionV3Baseline()
     
-    # Load pretrained weights for HVT
-    hvt_model.load_state_dict(torch.load(PRETRAINED_MODEL_PATH))
-    logging.info(f"Loaded pretrained weights for DiseaseAwareHVT from {PRETRAINED_MODEL_PATH}")
+    # Load pretrained weights for HVT, ignoring the classifier head mismatch
+    pretrained_dict = torch.load(PRETRAINED_MODEL_PATH)
+    model_dict = hvt_model.state_dict()
+    
+    # Filter out the classifier head (head.weight and head.bias) from the pretrained dict
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
+    
+    # Update the model's state dict with the pretrained weights
+    model_dict.update(pretrained_dict)
+    hvt_model.load_state_dict(model_dict)
+    logging.info(f"Loaded pretrained weights for DiseaseAwareHVT from {PRETRAINED_MODEL_PATH} (classifier head excluded due to class mismatch)")
     
     # Initialize augmentations
     augmentations = FinetuneAugmentation(img_size)
@@ -43,21 +74,56 @@ def main():
     hvt_finetuner = Finetuner(hvt_model, augmentations, device)
     baseline_finetuner = Finetuner(baseline_model, augmentations, device)
     
-    # Dummy data for testing (replace with real dataset later)
-    rgb = torch.randn(FINETUNE_BATCH_SIZE, 3, img_size[0], img_size[1])
-    rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min())  # Normalize to [0, 1]
-    spectral = torch.randn(FINETUNE_BATCH_SIZE, 1, img_size[0], img_size[1])
-    spectral = (spectral - spectral.min()) / (spectral.max() - spectral.min())  # Normalize to [0, 1]
-    labels = torch.randint(0, NUM_CLASSES, (FINETUNE_BATCH_SIZE,))  # Random labels (0 to NUM_CLASSES-1)
-    
     # Fine-tune HVT
     logging.info("Fine-tuning DiseaseAwareHVT...")
-    hvt_finetuner.finetune(rgb, spectral, labels)
+    for epoch in range(5):  # Use a fixed number of epochs for simplicity
+        # Training loop
+        hvt_finetuner.model.train()
+        train_loss = 0.0
+        for batch_idx, (rgb, spectral, labels) in enumerate(train_loader):
+            loss = hvt_finetuner.train_step(rgb, spectral, labels)
+            train_loss += loss
+        train_loss /= len(train_loader)
+        
+        # Validation loop
+        val_metrics = {"accuracy": 0.0, "f1": 0.0}
+        hvt_finetuner.model.eval()
+        with torch.no_grad():
+            for rgb, spectral, labels in val_loader:
+                metrics = hvt_finetuner.evaluate(rgb, spectral, labels)
+                val_metrics["accuracy"] += metrics["accuracy"]
+                val_metrics["f1"] += metrics["f1"]
+        val_metrics["accuracy"] /= len(val_loader)
+        val_metrics["f1"] /= len(val_loader)
+        
+        logging.info(f"Epoch {epoch+1}/5, Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
+    
     hvt_finetuner.save_model("finetuned_hvt.pth")
     
     # Fine-tune baseline
     logging.info("Fine-tuning InceptionV3Baseline...")
-    baseline_finetuner.finetune(rgb, spectral, labels)
+    for epoch in range(5):  # Use a fixed number of epochs for simplicity
+        # Training loop
+        baseline_finetuner.model.train()
+        train_loss = 0.0
+        for batch_idx, (rgb, spectral, labels) in enumerate(train_loader):
+            loss = baseline_finetuner.train_step(rgb, spectral, labels)
+            train_loss += loss
+        train_loss /= len(train_loader)
+        
+        # Validation loop
+        val_metrics = {"accuracy": 0.0, "f1": 0.0}
+        baseline_finetuner.model.eval()
+        with torch.no_grad():
+            for rgb, spectral, labels in val_loader:
+                metrics = baseline_finetuner.evaluate(rgb, spectral, labels)
+                val_metrics["accuracy"] += metrics["accuracy"]
+                val_metrics["f1"] += metrics["f1"]
+        val_metrics["accuracy"] /= len(val_loader)
+        val_metrics["f1"] /= len(val_loader)
+        
+        logging.info(f"Epoch {epoch+1}/5, Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
+    
     baseline_finetuner.save_model("finetuned_baseline.pth")
 
 if __name__ == "__main__":

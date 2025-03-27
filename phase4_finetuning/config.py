@@ -16,3 +16,4 @@ FINETUNE_LR = 1e-4  # Learning rate for fine-tuning
 FINETUNE_EPOCHS = 5  # Number of fine-tuning epochs (for testing; increase for real training)
 FINETUNE_BATCH_SIZE = 4  # Batch size for fine-tuning
 PRETRAINED_MODEL_PATH = "pretrained_hvt.pth"  # Path to pretrained weights
+NUM_CLASSES = 7  # Updated to match the number of classes in SAR-CLD-2024 dataset (7 classes)
