@@ -1,5 +1,6 @@
 # phase3_pretraining/utils/losses.py
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from config import TEMPERATURE
 
