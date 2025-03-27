@@ -23,7 +23,7 @@ class HVTBlock(nn.Module):
         return x
 
 class DiseaseAwareHVT(nn.Module):
-    def __init__(self, img_size: tuple, embed_dim: int = 192, num_heads: int = 8, num_blocks: int = 6):
+    def __init__(self, img_size: tuple, embed_dim: int = 256, num_heads: int = 8, num_blocks: int = 8):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_patches = (img_size[0] // 4) * (img_size[1] // 4)

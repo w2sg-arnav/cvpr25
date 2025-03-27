@@ -1,5 +1,9 @@
 import torch
 from torchvision import transforms
+import logging
+
+# Use a module-specific logger
+logger = logging.getLogger(__name__)
 
 class SimCLRAugmentation:
     def __init__(self, img_size: tuple, device: str = "cuda"):
@@ -19,4 +23,8 @@ class SimCLRAugmentation:
         # Apply augmentations to each image in the batch
         augmented = torch.stack([self.transform(transforms.ToPILImage()(img)) for img in x])
         # Move to device
-        return augmented.to(self.device)
+        augmented = augmented.to(self.device)
+        # Ensure the output requires gradients if the input does
+        if x.requires_grad and not augmented.requires_grad:
+            logger.warning("Augmented output does not require gradients, but input does. This may break the computation graph.")
+        return augmented

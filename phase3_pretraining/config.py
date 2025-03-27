@@ -8,10 +8,10 @@ np.random.seed(42)
 
 # Pretraining-specific configurations
 PROJECTION_DIM = 256  # Updated to match the projection head output in hvt.py
-PRETRAIN_LR = 4.5e-3  # Increased learning rate for faster convergence with batch size 192
+PRETRAIN_LR = 8e-3  # Slightly increased learning rate for controlled descent
 PRETRAIN_EPOCHS = 50  # Number of epochs for pretraining
 PRETRAIN_BATCH_SIZE = 192  # Batch size to avoid OOM
-TEMPERATURE = 0.5  # Adjusted temperature for InfoNCE loss (increased from 0.2)
+TEMPERATURE = 0.2  # Adjusted temperature for InfoNCE loss (increased to 0.2)
 ACCUM_STEPS = 1  # No accumulation needed with larger batch size
 
 PROGRESSIVE_RESOLUTIONS = [(128, 128), (256, 256), (384, 384)]

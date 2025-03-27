@@ -1,41 +1,11 @@
 import torch
 import torch.nn as nn
-from torch.optim import Optimizer
+from torch.optim import Adam
 from config import PRETRAIN_LR, ACCUM_STEPS
+import logging
 
-# Custom LARS Optimizer
-class LARS(Optimizer):
-    def __init__(self, params, lr=1e-3, momentum=0.9, weight_decay=1e-4, eta=0.001):
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, eta=eta)
-        super(LARS, self).__init__(params, defaults)
-
-    def step(self):
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                param = p.data
-
-                # Apply weight decay
-                if group['weight_decay'] > 0:
-                    grad = grad.add(param, alpha=group['weight_decay'])
-
-                # Compute local learning rate using LARS
-                param_norm = torch.norm(param)
-                grad_norm = torch.norm(grad)
-                trust_ratio = group['eta'] * param_norm / (grad_norm + 1e-6)
-                trust_ratio = torch.clamp(trust_ratio, 0.0, 1.0)
-
-                # Update momentum
-                if 'momentum_buffer' not in self.state[p]:
-                    self.state[p]['momentum_buffer'] = torch.zeros_like(param)
-                momentum_buffer = self.state[p]['momentum_buffer']
-                momentum_buffer.mul_(group['momentum']).add_(grad, alpha=1.0)
-
-                # Update parameter
-                scaled_lr = group['lr'] * trust_ratio
-                param.add_(momentum_buffer, alpha=-scaled_lr)
+# Use a module-specific logger
+logger = logging.getLogger(__name__)
 
 class Pretrainer:
     def __init__(self, model: nn.Module, augmentations, loss_fn, device: str):
@@ -44,14 +14,18 @@ class Pretrainer:
         self.loss_fn = loss_fn
         self.device = device
         
-        # Use LARS optimizer
-        self.optimizer = LARS(
+        # Use Adam optimizer
+        self.optimizer = Adam(
             self.model.parameters(),
             lr=PRETRAIN_LR,
-            momentum=0.9,
-            weight_decay=1e-4,
-            eta=0.001
+            weight_decay=1e-4
         )
+        
+        # Verify that all model parameters require gradients
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                logger.warning(f"Parameter {name} does not require gradients. Enabling gradients.")
+                param.requires_grad = True
         
         self.accum_steps = ACCUM_STEPS
         self.step_count = 0
@@ -74,6 +48,12 @@ class Pretrainer:
         
         # Compute InfoNCE loss
         loss = self.loss_fn(features1, features2) / self.accum_steps
+        
+        # Verify that the loss requires gradients
+        if not loss.requires_grad:
+            logger.error("Loss does not require gradients. Check the computation graph.")
+            raise RuntimeError("Loss does not require gradients.")
+        
         loss.backward()
         
         self.step_count += 1
