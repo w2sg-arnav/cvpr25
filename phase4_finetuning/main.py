@@ -79,6 +79,12 @@ def main():
     hvt_model = DiseaseAwareHVT(img_size=img_size).to(device)
     baseline_model = EfficientNetBaseline().to(device)
     
+    # Freeze early layers of EfficientNetBaseline (e.g., first 5 blocks)
+    for name, param in baseline_model.named_parameters():
+        if "features.0" in name or "features.1" in name or "features.2" in name or "features.3" in name or "features.4" in name:
+            param.requires_grad = False
+    logging.info("Froze early layers (features.0 to features.4) of EfficientNetBaseline")
+    
     # Load pretrained weights for HVT, ignoring the classifier head mismatch
     pretrained_dict = torch.load(PRETRAINED_MODEL_PATH, map_location=device)
     model_dict = hvt_model.state_dict()
@@ -95,7 +101,8 @@ def main():
     baseline_finetuner = Finetuner(baseline_model, augmentations, device, class_weights=class_weights)
     # Adjust learning rate for EfficientNetBaseline
     for param_group in baseline_finetuner.optimizer.param_groups:
-        param_group['lr'] = 1e-4  # Smaller learning rate for EfficientNet
+        param_group['lr'] = 5e-5  # Reduced learning rate for better stability
+    logging.info("Set learning rate for EfficientNetBaseline to 5e-5")
     
     # Initialize GradScaler for mixed precision training
     scaler = GradScaler()

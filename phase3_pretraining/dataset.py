@@ -7,6 +7,9 @@ import numpy as np
 import logging
 from collections import Counter
 
+# Use a module-specific logger (logging setup is handled in pretrain.py)
+logger = logging.getLogger(__name__)
+
 class SARCLD2024Dataset(Dataset):
     def __init__(self, root_dir: str, img_size: tuple, split: str = "train", train_split: float = 0.8, normalize: bool = True):
         """
@@ -39,23 +42,23 @@ class SARCLD2024Dataset(Dataset):
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Dataset root directory does not exist: {root_dir}")
         
-        logging.info(f"Loading dataset from: {root_dir}")
+        logger.info(f"Loading dataset from: {root_dir}")
         
         # Traverse both Original and Augmented datasets
         for dataset_type in ["Original Dataset", "Augmented Dataset"]:
             dataset_path = os.path.join(root_dir, dataset_type)
             if not os.path.exists(dataset_path):
-                logging.warning(f"Dataset path does not exist, skipping: {dataset_path}")
+                logger.warning(f"Dataset path does not exist, skipping: {dataset_path}")
                 continue
             
-            logging.info(f"Scanning dataset: {dataset_type}")
+            logger.info(f"Scanning dataset: {dataset_type}")
             for class_name in self.classes:
                 class_path = os.path.join(dataset_path, class_name)
                 if not os.path.exists(class_path):
-                    logging.warning(f"Class path does not exist, skipping: {class_path}")
+                    logger.warning(f"Class path does not exist, skipping: {class_path}")
                     continue
                 
-                logging.info(f"Scanning class: {class_name}")
+                logger.info(f"Scanning class: {class_name}")
                 for img_name in os.listdir(class_path):
                     if img_name.lower().endswith((".jpg", ".jpeg", ".png")):
                         img_path = os.path.join(class_path, img_name)
@@ -72,12 +75,12 @@ class SARCLD2024Dataset(Dataset):
         
         # Log class distribution
         class_counts = Counter(self.labels)
-        logging.info("Class distribution:")
+        logger.info("Class distribution:")
         for idx, count in class_counts.items():
             class_name = self.classes[idx]
-            logging.info(f"Class {class_name}: {count} samples ({count/len(self.labels)*100:.2f}%)")
+            logger.info(f"Class {class_name}: {count} samples ({count/len(self.labels)*100:.2f}%)")
         
-        logging.info(f"Total images found: {len(self.image_paths)}")
+        logger.info(f"Total images found: {len(self.image_paths)}")
         
         # Split into train and validation sets
         indices = np.arange(len(self.image_paths))
@@ -90,7 +93,7 @@ class SARCLD2024Dataset(Dataset):
         else:  # val
             self.indices = indices[split_idx:]
         
-        logging.info(f"{self.split.capitalize()} split size: {len(self.indices)} samples")
+        logger.info(f"{self.split.capitalize()} split size: {len(self.indices)} samples")
         
         # Define preprocessing transforms
         transforms_list = [
