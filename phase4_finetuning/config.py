@@ -12,8 +12,8 @@ import numpy as np
 np.random.seed(42)
 
 # Fine-tuning-specific configurations
-FINETUNE_LR = 1e-4  # Learning rate for fine-tuning
-FINETUNE_EPOCHS = 5  # Number of fine-tuning epochs (for testing; increase for real training)
-FINETUNE_BATCH_SIZE = 4  # Batch size for fine-tuning
+FINETUNE_LR = 3e-4  # Learning rate for fine-tuning
+FINETUNE_EPOCHS = 30  # Increased to 30 epochs
+FINETUNE_BATCH_SIZE = 32  # Batch size for fine-tuning
 PRETRAINED_MODEL_PATH = "pretrained_hvt.pth"  # Path to pretrained weights
-NUM_CLASSES = 7  # Updated to match the number of classes in SAR-CLD-2024 dataset (7 classes)
+NUM_CLASSES = 7  # Number of classes in SAR-CLD-2024 dataset

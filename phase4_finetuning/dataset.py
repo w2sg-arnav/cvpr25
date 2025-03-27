@@ -6,12 +6,13 @@ import torchvision.transforms as T
 from PIL import Image
 import numpy as np
 import logging
+from collections import Counter
 
 class SARCLD2024Dataset(Dataset):
     def __init__(self, root_dir: str, img_size: tuple, split: str = "train", train_split: float = 0.8):
         """
         Args:
-            root_dir (str): Root directory of the dataset (e.g., '/teamspace/studios/this_studio/cvpr25/data/sar_cld_2024').
+            root_dir (str): Root directory of the dataset.
             img_size (tuple): Desired image size (height, width), e.g., (384, 384).
             split (str): 'train' or 'val' to specify the dataset split.
             train_split (float): Fraction of data to use for training (e.g., 0.8 for 80% train, 20% val).
@@ -55,7 +56,6 @@ class SARCLD2024Dataset(Dataset):
                 
                 logging.info(f"Scanning class: {class_name}")
                 for img_name in os.listdir(class_path):
-                    # Make file extension check case-insensitive
                     if img_name.lower().endswith((".jpg", ".jpeg", ".png")):
                         img_path = os.path.join(class_path, img_name)
                         self.image_paths.append(img_path)
@@ -68,6 +68,13 @@ class SARCLD2024Dataset(Dataset):
         # Check if any images were found
         if len(self.image_paths) == 0:
             raise ValueError(f"No images found in the dataset at {root_dir}. Please check the directory structure and file extensions.")
+        
+        # Log class distribution
+        class_counts = Counter(self.labels)
+        logging.info("Class distribution:")
+        for idx, count in class_counts.items():
+            class_name = self.classes[idx]
+            logging.info(f"Class {class_name}: {count} samples ({count/len(self.labels)*100:.2f}%)")
         
         logging.info(f"Total images found: {len(self.image_paths)}")
         
@@ -90,13 +97,6 @@ class SARCLD2024Dataset(Dataset):
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Standard ImageNet normalization
         ])
-        
-        # Spectral transform (if spectral data is single-channel)
-        self.spectral_transform = T.Compose([
-            T.Resize(self.img_size),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5], std=[0.5])
-        ])
     
     def __len__(self):
         return len(self.indices)
@@ -109,28 +109,18 @@ class SARCLD2024Dataset(Dataset):
         img_path = self.image_paths[actual_idx]
         label = self.labels[actual_idx]
         
-        # Load image as a numpy array to check channels
-        img = Image.open(img_path)
-        img_array = np.array(img)
+        # Load image as RGB
+        img = Image.open(img_path).convert("RGB")
+        rgb = self.transform(img)
         
-        # Extract RGB (first 3 channels)
-        if img_array.ndim == 3 and img_array.shape[2] >= 3:
-            rgb = Image.fromarray(img_array[:, :, :3])  # Take first 3 channels as RGB
-        else:
-            rgb = img.convert("RGB")
-        rgb = self.transform(rgb)
-        
-        # Extract spectral data (if available, e.g., 4th channel)
-        if img_array.ndim == 3 and img_array.shape[2] > 3:
-            # Use the 4th channel as spectral data
-            spectral = Image.fromarray(img_array[:, :, 3])
-            spectral = self.spectral_transform(spectral)
-        else:
-            # Fallback: Create a dummy spectral channel
-            spectral = torch.randn(1, self.img_size[0], self.img_size[1])
-            spectral = (spectral - spectral.min()) / (spectral.max() - spectral.min())  # Normalize to [0, 1]
-        
-        return rgb, spectral, torch.tensor(label, dtype=torch.long)
+        return rgb, torch.tensor(label, dtype=torch.long)
 
     def get_class_names(self):
         return self.classes
+    
+    def get_class_weights(self):
+        # Compute class weights for imbalanced dataset
+        class_counts = Counter(self.labels)
+        total_samples = len(self.labels)
+        weights = [total_samples / (len(self.classes) * class_counts[i]) for i in range(len(self.classes))]
+        return torch.tensor(weights, dtype=torch.float)
