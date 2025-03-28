@@ -1,30 +1,36 @@
 import torch
-from torchvision import transforms
+import torchvision.transforms.functional as TF
 import logging
+from config import DEVICE
 
-# Use a module-specific logger
 logger = logging.getLogger(__name__)
 
 class SimCLRAugmentation:
-    def __init__(self, img_size: tuple, device: str = "cuda"):
-        self.device = device
-        self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(img_size, scale=(0.2, 1.0)),  # Stronger crop
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),  # Stronger color jitter
-            transforms.RandomGrayscale(p=0.2),  # Add grayscale
-            transforms.RandomApply([transforms.GaussianBlur(kernel_size=img_size[0]//10*2+1, sigma=(0.1, 2.0))], p=0.5),
-            transforms.ToTensor(),
-        ])
-    
+    def __init__(self, img_size: tuple):
+        self.img_size = img_size
+        self.device = DEVICE  # Augmentations happen on the specified device
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        # x is expected to be a batch of images with shape [B, C, H, W]
-        batch_size = x.shape[0]
-        # Apply augmentations to each image in the batch
-        augmented = torch.stack([self.transform(transforms.ToPILImage()(img)) for img in x])
-        # Move to device
-        augmented = augmented.to(self.device)
-        # Ensure the output requires gradients if the input does
-        if x.requires_grad and not augmented.requires_grad:
-            logger.warning("Augmented output does not require gradients, but input does. This may break the computation graph.")
-        return augmented
+        x = x.to(self.device) # Move input to device before augmentation
+
+        x = TF.resize(x, self.img_size)
+        if torch.rand(1) < 0.5:
+            x = TF.hflip(x)
+
+        brightness_factor = torch.rand(1).item() * 1.6 + 0.2
+        x = TF.adjust_brightness(x, brightness_factor)
+
+        contrast_factor = torch.rand(1).item() * 1.6 + 0.2
+        x = TF.adjust_contrast(x, contrast_factor)
+
+        saturation_factor = torch.rand(1).item() * 1.6 + 0.2
+        x = TF.adjust_saturation(x, saturation_factor)
+
+        hue_factor = torch.rand(1).item() * 0.4 - 0.2
+        x = TF.adjust_hue(x, hue_factor)
+
+        if torch.rand(1) < 0.2:
+            x = TF.rgb_to_grayscale(x, num_output_channels=3)
+
+        x = TF.gaussian_blur(x, kernel_size=self.img_size[0]//10*2+1, sigma=(0.1, 2.0))
+        return x

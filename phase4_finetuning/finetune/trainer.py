@@ -1,15 +1,18 @@
 # phase4_finetuning/finetune/trainer.py
 import torch
 import torch.nn as nn
-import logging  # Already added to fix the error
+import logging
 from utils.metrics import compute_metrics
 
 class Finetuner:
-    def __init__(self, model, augmentations, device, class_weights=None):
+    def __init__(self, model, augmentations, device, class_weights=None, label_smoothing=0.0):
         self.model = model.to(device)
         self.augmentations = augmentations
         self.device = device
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights.to(device) if class_weights is not None else None)
+        self.criterion = nn.CrossEntropyLoss(
+            weight=class_weights.to(device) if class_weights is not None else None,
+            label_smoothing=label_smoothing  # Added label smoothing support
+        )
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=3e-4, weight_decay=0.01)  # Use AdamW with weight decay
     
     def train_step(self, rgb, labels):
