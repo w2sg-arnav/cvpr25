@@ -1,11 +1,11 @@
-# phase4_finetuning/finetune/trainer.py
 import torch
 import torch.nn as nn
 import logging
 from utils.metrics import compute_metrics
 
 class Finetuner:
-    def __init__(self, model, augmentations, device, class_weights=None, label_smoothing=0.0):
+    def __init__(self, model, augmentations, device, class_weights=None, label_smoothing=0.0, 
+                 optimizer_class=torch.optim.AdamW, optimizer_params=None):
         self.model = model.to(device)
         self.augmentations = augmentations
         self.device = device
@@ -13,7 +13,10 @@ class Finetuner:
             weight=class_weights.to(device) if class_weights is not None else None,
             label_smoothing=label_smoothing  # Added label smoothing support
         )
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=3e-4, weight_decay=0.01)  # Use AdamW with weight decay
+        # Use optimizer_class and optimizer_params, with defaults if None
+        if optimizer_params is None:
+            optimizer_params = {"lr": 3e-4, "weight_decay": 0.01}
+        self.optimizer = optimizer_class(self.model.parameters(), **optimizer_params)
     
     def train_step(self, rgb, labels):
         # Forward pass
@@ -30,12 +33,16 @@ class Finetuner:
         
         return loss
     
-    def evaluate(self, rgb, labels):
+    def evaluate(self, rgb, labels, custom_preds=None):
         rgb, labels = rgb.to(self.device), labels.to(self.device)
         
         with torch.no_grad():
-            outputs = self.model(rgb)
-            _, preds = torch.max(outputs, 1)
+            if custom_preds is None:
+                outputs = self.model(rgb)
+                _, preds = torch.max(outputs, 1)
+            else:
+                # Use custom predictions (e.g., for TTA)
+                _, preds = torch.max(custom_preds, 1)
         
         metrics = compute_metrics(preds.cpu().numpy(), labels.cpu().numpy())
         return metrics
