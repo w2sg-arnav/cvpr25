@@ -38,7 +38,10 @@ DEFAULT_CONFIG = {
     "amp_enabled": False,
     "augmentations_enabled": True,
     "pretrained": True,
-    "best_model_path": "best_hvt.pth"
+    "best_model_path": "best_hvt.pth",
+    "embed_dim": 128,
+    "num_heads": 4,
+    "log_interval": 50  # Log training info every 50 batches
 }
 
 def load_config(config_path=None):
@@ -89,74 +92,135 @@ class FinetuneAugmentation:
         return self.transform(rgb)
 
 # Dataset Class
+import os
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms as T
+from PIL import Image
+import numpy as np
+import logging
+from collections import Counter
+
 class SARCLD2024Dataset(Dataset):
     def __init__(self, root_dir: str, img_size: tuple, split: str = "train", train_split: float = 0.8, normalize: bool = True):
+        """
+        Args:
+            root_dir (str): Root directory of the dataset.
+            img_size (tuple): Desired image size (height, width), e.g., (384, 384).
+            split (str): 'train' or 'val' to specify the dataset split.
+            train_split (float): Fraction of data to use for training (e.g., 0.8 for 80% train, 20% val).
+            normalize (bool): Whether to apply ImageNet normalization (True for fine-tuning, False for pretraining).
+        """
         self.root_dir = root_dir
         self.img_size = img_size
         self.split = split
         self.train_split = train_split
         self.normalize = normalize
-        self.classes = ["Bacterial Blight", "Curl Virus", "Healthy Leaf", "Herbicide Growth Damage", 
-                       "Leaf Hopper Jassids", "Leaf Redding", "Leaf Variegation"]
+        
+        # Define class names and labels
+        self.classes = [
+            "Bacterial Blight", "Curl Virus", "Healthy Leaf", 
+            "Herbicide Growth Damage", "Leaf Hopper Jassids", 
+            "Leaf Redding", "Leaf Variegation"
+        ]
         self.class_to_idx = {cls: idx for idx, cls in enumerate(self.classes)}
-
+        
+        # Collect all image paths and labels
         self.image_paths = []
         self.labels = []
+        
+        # Check if root_dir exists
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Dataset root directory does not exist: {root_dir}")
+        
         logging.info(f"Loading dataset from: {root_dir}")
-
+        
+        # Traverse both Original and Augmented datasets
         for dataset_type in ["Original Dataset", "Augmented Dataset"]:
             dataset_path = os.path.join(root_dir, dataset_type)
-            if not os.path.exists(dataset_path):
+            if not os.path.isdir(dataset_path):
                 logging.warning(f"Dataset path does not exist, skipping: {dataset_path}")
                 continue
+            
+            logging.info(f"Scanning dataset: {dataset_type}")
             for class_name in self.classes:
                 class_path = os.path.join(dataset_path, class_name)
-                if not os.path.exists(class_path):
+                if not os.path.isdir(class_path):
                     logging.warning(f"Class path does not exist, skipping: {class_path}")
                     continue
+                
+                logging.info(f"Scanning class: {class_name}")
                 for img_name in os.listdir(class_path):
                     if img_name.lower().endswith((".jpg", ".jpeg", ".png")):
                         img_path = os.path.join(class_path, img_name)
                         self.image_paths.append(img_path)
                         self.labels.append(self.class_to_idx[class_name])
-
+        
+        # Convert to numpy arrays for splitting
         self.image_paths = np.array(self.image_paths)
         self.labels = np.array(self.labels)
+        
+        # Check if any images were found
         if len(self.image_paths) == 0:
-            raise ValueError(f"No images found in the dataset at {root_dir}.")
+            raise ValueError(f"No images found in the dataset at {root_dir}. Please check the directory structure and file extensions.")
+        
+        # Log class distribution
         class_counts = Counter(self.labels)
         logging.info("Class distribution:")
         for idx, count in class_counts.items():
-            logging.info(f"Class {self.classes[idx]}: {count} samples ({count / len(self.labels) * 100:.2f}%)")
-
+            class_name = self.classes[idx]
+            logging.info(f"Class {class_name}: {count} samples ({count/len(self.labels)*100:.2f}%)")
+        
+        logging.info(f"Total images found: {len(self.image_paths)}")
+        
+        # Split into train and validation sets
         indices = np.arange(len(self.image_paths))
-        np.random.seed(42)
+        np.random.seed(42)  # For reproducibility
         np.random.shuffle(indices)
+        
         split_idx = int(len(indices) * self.train_split)
-        self.indices = indices[:split_idx] if split == "train" else indices[split_idx:]
+        train_indices = indices[:split_idx]
+        val_indices = indices[split_idx:]
+        if self.split == "train":
+            self.indices = train_indices
+        else:  # val
+            self.indices = val_indices
+        
         logging.info(f"{self.split.capitalize()} split size: {len(self.indices)} samples")
-
-        transforms_list = [T.Resize(self.img_size), T.ToTensor()]
+        
+        transforms_list = [
+            T.Resize(self.img_size),
+            T.ToTensor(),
+        ]
         if self.normalize:
-            transforms_list.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+            transforms_list.append(
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Standard ImageNet normalization
+            )
         self.transform = T.Compose(transforms_list)
-
+    
     def __len__(self):
         return len(self.indices)
-
+    
     def __getitem__(self, idx):
+        # Get the actual index from the split indices
         actual_idx = self.indices[idx]
+        
+        # Load image
         img_path = self.image_paths[actual_idx]
         label = self.labels[actual_idx]
+        logging.debug(f"Accessing image: {img_path}, label: {label}, idx: {idx}")
+        
+        # Load image as RGB
         img = Image.open(img_path).convert("RGB")
         rgb = self.transform(img)
-        if idx < 5:  # Log first 5 samples
-            logging.debug(f"Sample {idx} - RGB min: {rgb.min()}, max: {rgb.max()}")
+        
         return rgb, torch.tensor(label, dtype=torch.long)
 
+    def get_class_names(self):
+        return self.classes
+    
     def get_class_weights(self):
+        # Compute class weights for imbalanced dataset
         class_counts = Counter(self.labels)
         total_samples = len(self.labels)
         weights = [total_samples / (len(self.classes) * class_counts[i]) for i in range(len(self.classes))]
@@ -164,31 +228,35 @@ class SARCLD2024Dataset(Dataset):
 
 # Model Definition
 class SwinTransformerBlock(nn.Module):
-    def __init__(self, dim=128, num_heads=4, window_size=4, drop_path=0.1):
+    def __init__(self, embed_dim, num_heads):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
+            nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim * 4, dim)
+            nn.Linear(embed_dim * 4, embed_dim),
         )
-        self.drop_path = nn.Dropout(drop_path) if drop_path > 0 else nn.Identity()
+        self.drop_path = nn.Dropout(0.1) if 0.1 > 0 else nn.Identity() #Use the correct drop identity here
+        self._initialize_weights() #add initilizer
 
     def forward(self, x):
-        shortcut = x
-        x = self.norm1(x)
-        x = x.transpose(0, 1)
-        attn_output, _ = self.attn(x, x, x)
-        check_tensor(attn_output, "attn_output")
-        x = shortcut + self.drop_path(attn_output.transpose(0, 1))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        attn_output, _ = self.attention(x, x, x)
+        x = self.norm1(x + attn_output)
+        mlp_output = self.mlp(x)
+        x = self.norm2(x + mlp_output)
         return x
 
+    def _initialize_weights(self): #add initilizer
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
 class DiseaseAwareHVT(nn.Module):
-    def __init__(self, img_size, num_classes):
+    def __init__(self, img_size, num_classes, embed_dim = 128, num_heads = 4):
         super().__init__()
         self.efficientnet = torchvision.models.efficientnet_b3(weights="IMAGENET1K_V1")
         self.efficientnet.classifier = nn.Identity()
@@ -197,7 +265,7 @@ class DiseaseAwareHVT(nn.Module):
         self.patch_embed = nn.Conv2d(3, 128, kernel_size=4, stride=4)
         num_patches = (img_size[0] // 4) * (img_size[1] // 4)
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, 128))
-        self.swin_layers = nn.ModuleList([SwinTransformerBlock(dim=128, num_heads=4, drop_path=0.1) for _ in range(6)])
+        self.swin_layers = nn.ModuleList([SwinTransformerBlock(embed_dim=embed_dim, num_heads=num_heads) for _ in range(6)])
         self.norm = nn.LayerNorm(128)
         swin_output_dim = 128
 
@@ -211,6 +279,9 @@ class DiseaseAwareHVT(nn.Module):
             nn.Linear(1024, num_classes)
         )
         self._initialize_weights()
+            # Print parameters
+        for name, param in self.named_parameters():
+            logging.info(f"Parameter name: {name}, shape: {param.shape}, requires_grad: {param.requires_grad}")
 
     def forward(self, x):
         eff_features = self.efficientnet(x)
@@ -240,6 +311,13 @@ class DiseaseAwareHVT(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+# Custom Metrics calculation function (moved out of utils due to import issues)
+def compute_metrics(preds, labels):
+    """Computes accuracy and F1-score using sklearn."""
+    acc = accuracy_score(labels, preds)
+    f1 = f1_score(labels, preds, average='weighted')
+    return {"accuracy": acc, "f1_score": f1}
+
 # Training Loop
 def main():
     args = parse_args()
@@ -251,8 +329,23 @@ def main():
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
 
-    # Remove any existing console handlers to avoid screen output
+    # Set up logging for this epoch
+
     logging.getLogger().handlers = []
+
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        filename=f"training.log",
+                        filemode='w')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.addHandler(console_handler)
+
     # Suppress PIL logging noise
     logging.getLogger('PIL').setLevel(logging.WARNING)
 
@@ -280,10 +373,10 @@ def main():
     augmentations = FinetuneAugmentation(config["img_size"])
 
     # Model Initialization
-    hvt_model = DiseaseAwareHVT(img_size=config["img_size"], num_classes=config["num_classes"]).to(device)
+    finetune_model = DiseaseAwareHVT(img_size=config["img_size"], num_classes=config["num_classes"], embed_dim = config["embed_dim"], num_heads = config["num_heads"]).to(device) #Changed name from pretrain to finetune
 
     # Optimizer and Schedulers
-    optimizer = torch.optim.AdamW(hvt_model.parameters(), lr=config["initial_learning_rate"], 
+    optimizer = torch.optim.AdamW(finetune_model.parameters(), lr=config["initial_learning_rate"], 
                                   weight_decay=config["weight_decay"])
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=config["warmup_epochs"])
     cosine_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=config["t_0"], T_mult=config["t_mult"], 
@@ -299,35 +392,24 @@ def main():
     best_val_acc = 0.0
 
     for epoch in range(20):
-        # Set up logging for this epoch
-        log_file = os.path.join(log_dir, f"epoch_{epoch + 1}.log")
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-
-        logger = logging.getLogger()
-        logger.handlers = []  # Remove all existing handlers
-        logger.addHandler(file_handler)
-        logger.setLevel(logging.DEBUG)
 
         # Log initial info
-        logger.info(f"Using device: {device}")
-        logger.info(f"Training dataset size: {len(train_dataset)} samples")
-        logger.info(f"Validation dataset size: {len(val_dataset)} samples")
-        logger.info("Starting training...")
+        root_logger.info(f"Using device: {device}")
+        root_logger.info(f"Training dataset size: {len(train_dataset)} samples")
+        root_logger.info(f"Validation dataset size: {len(val_dataset)} samples")
+        root_logger.info("Starting training...")
 
         # Training phase
-        hvt_model.train()
+        finetune_model.train() #Changed name from pretrain to finetune
         train_loss = 0.0
         optimizer.zero_grad()
 
-        with tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}/20", file=open(os.devnull, 'w')) as pbar:
+        with tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}/20") as pbar:
             for i, (rgb, labels) in enumerate(train_loader):
                 rgb, labels = rgb.to(device), labels.to(device)
-                logger.debug(f"Train RGB min: {rgb.min()}, max: {rgb.max()}")
+                logging.debug(f"Train RGB min: {rgb.min()}, max: {rgb.max()}")
                 if torch.isnan(rgb).any() or torch.isinf(rgb).any():
-                    logger.warning(f"Skipping batch {i} due to NaN/Inf in inputs")
+                    logging.warning(f"Skipping batch {i} due to NaN/Inf in inputs")
                     continue
 
                 if config["augmentations_enabled"]:
@@ -336,10 +418,10 @@ def main():
                     rgb_aug = rgb
 
                 with autocast(enabled=config["amp_enabled"]):
-                    outputs = hvt_model(rgb_aug)
+                    outputs = finetune_model(rgb_aug) #Changed name from pretrain to finetune
                     check_tensor(outputs, "Training Outputs")
                     if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                        logger.warning(f"Skipping batch {i} due to NaN/Inf in outputs")
+                        logging.warning(f"Skipping batch {i} due to NaN/Inf in outputs")
                         continue
                     loss = nn.CrossEntropyLoss(weight=class_weights, 
                                                label_smoothing=config["label_smoothing"])(outputs, labels)
@@ -347,7 +429,7 @@ def main():
                 loss = loss / config["accumulation_steps"]
                 scaler.scale(loss).backward()
                 if (i + 1) % config["accumulation_steps"] == 0:
-                    torch.nn.utils.clip_grad_norm_(hvt_model.parameters(), max_norm=config["clip_grad_norm"])
+                    torch.nn.utils.clip_grad_norm_(finetune_model.parameters(), max_norm=config["clip_grad_norm"]) #Changed name from pretrain to finetune
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
@@ -355,34 +437,36 @@ def main():
                 train_loss += loss.item() * config["accumulation_steps"]
                 pbar.update(1)
                 pbar.set_postfix({"Loss": f"{loss.item() * config['accumulation_steps']:.4f}"})
+                if i % config["log_interval"] == 0:
+                    logging.info(f"Batch {i}: Loss = {loss.item() * config['accumulation_steps']:.4f}")
 
         train_loss /= len(train_loader)
 
         # Validation phase
-        val_loss, val_acc, val_f1 = validate_model(hvt_model, val_loader, class_weights, device, 
+        val_loss, val_acc, val_f1 = validate_model(finetune_model, val_loader, class_weights, device, #Changed name from pretrain to finetune
                                                    config["amp_enabled"])
         scheduler.step()
         lr_reducer.step(val_acc)
 
         # Log epoch summary
-        logger.info(f"Epoch {epoch + 1}/20 - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+        print(f"Epoch {epoch + 1}/20 - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
                     f"Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}, Best Acc: {best_val_acc:.4f}")
 
         # Early stopping and model saving
         if val_acc > best_val_acc and not np.isnan(val_loss):
             best_val_acc = val_acc
-            torch.save(hvt_model.state_dict(), config["best_model_path"])
-            logger.info(f"New best model saved with Val Acc: {best_val_acc:.4f}")
+            torch.save(finetune_model.state_dict(), config["best_model_path"]) #Changed name from pretrain to finetune
+            logging.info(f"New best model saved with Val Acc: {best_val_acc:.4f}")
             patience_counter = 0
         else:
             patience_counter += 1
 
         if patience_counter >= config["patience"]:
-            logger.info(f"Early stopping after {config['patience']} epochs without improvement")
+            logging.info(f"Early stopping after {config['patience']} epochs without improvement")
             break
 
-    torch.save(hvt_model.state_dict(), "finetuned_hvt.pth")
-    logger.info(f"Final model saved. Best validation accuracy: {best_val_acc:.4f}")
+    torch.save(finetune_model.state_dict(), "finetuned_hvt.pth") #Changed name from pretrain to finetune
+    logging.info(f"Final model saved. Best validation accuracy: {best_val_acc:.4f}")
 
 def validate_model(model, val_loader, class_weights, device, amp_enabled):
     model.eval()
@@ -410,16 +494,39 @@ def validate_model(model, val_loader, class_weights, device, amp_enabled):
 
             val_loss += loss.item()
             preds = torch.argmax(outputs, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_preds = np.concatenate((all_preds, preds.cpu().numpy()))
+            all_labels = np.concatenate((all_labels, labels.cpu().numpy()))
 
     val_loss /= len(val_loader)
-    val_acc = accuracy_score(all_labels, all_labels) if all_preds else 0.0  # Fixed typo: all_labels vs all_preds
-    val_f1 = f1_score(all_labels, all_preds, average='weighted') if all_preds else 0.0
-    logger.debug(f"Validation labels range: min {min(all_labels)}, max {max(all_labels)}")
+    if len(all_labels) > 0 and len(all_preds) > 0:
+        val_acc = accuracy_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds, average='weighted')
+    else:
+        val_acc = 0.0
+        val_f1 = 0.0
+
+    logger.debug(f"Validation labels range: min {np.min(all_labels)}, max {np.max(all_labels)}")
     return val_loss, val_acc, val_f1
 
 if __name__ == "__main__":
+    #Move here
+    import os
+    import logging
+    import torch
+    import torch.nn as nn
+    import numpy as np
+    from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+    from torch.cuda.amp import GradScaler, autocast
+    from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau, LinearLR, SequentialLR
+    from tqdm import tqdm
+    from collections import Counter
+    import argparse
+    import yaml
+    import torchvision
+    import torchvision.transforms as T
+    from PIL import Image
+    from sklearn.metrics import accuracy_score, f1_score
+
     try:
         main()
     except Exception as e:
