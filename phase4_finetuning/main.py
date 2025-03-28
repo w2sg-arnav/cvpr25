@@ -4,7 +4,7 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 
 # Configure logging
@@ -125,20 +125,20 @@ def main():
         param_group['lr'] = 5e-5
     logging.info("Set learning rate for EfficientNetBaseline to 5e-5")
     
-    # Initialize GradScaler and schedulers
+    # Initialize GradScaler and scheduler with step decay
     scaler = GradScaler()
-    hvt_scheduler = CosineAnnealingLR(hvt_finetuner.optimizer, T_max=50, eta_min=1e-6)
-    baseline_scheduler = CosineAnnealingLR(baseline_finetuner.optimizer, T_max=50, eta_min=1e-6)
+    hvt_scheduler = StepLR(hvt_finetuner.optimizer, step_size=15, gamma=0.5)  # Halve LR every 15 epochs
+    baseline_scheduler = StepLR(baseline_finetuner.optimizer, step_size=15, gamma=0.5)
     
     # Fine-tune HVT with mixed precision
     print("Fine-tuning DiseaseAwareHVT with mixed precision...")
     logging.info("Fine-tuning DiseaseAwareHVT with mixed precision...")
     best_val_acc_hvt = 0.0
     best_model_path_hvt = "best_finetuned_hvt.pth"
-    patience = 10
+    patience = 15  # Increased patience
     patience_counter_hvt = 0
     
-    for epoch in range(50):
+    for epoch in range(100):  # Extended to 100 epochs
         # Progressive unfreezing for HVT
         if epoch == 10:
             for name, param in hvt_model.named_parameters():
@@ -159,12 +159,13 @@ def main():
         # HVT Training loop with tqdm
         hvt_finetuner.model.train()
         train_loss = 0.0
-        with tqdm(total=len(train_loader), desc=f"HVT Epoch {epoch+1}/50", file=sys.stdout) as pbar:
+        with tqdm(total=len(train_loader), desc=f"HVT Epoch {epoch+1}/100", file=sys.stdout) as pbar:
             for rgb, labels in train_loader:
                 rgb, labels = rgb.to(device), labels.to(device)
                 with autocast():
                     loss = hvt_finetuner.train_step(rgb, labels)
                 scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(hvt_finetuner.model.parameters(), max_norm=1.0)  # Gradient clipping
                 scaler.step(hvt_finetuner.optimizer)
                 scaler.update()
                 hvt_finetuner.optimizer.zero_grad()
@@ -186,9 +187,11 @@ def main():
         val_metrics["f1"] /= len(val_loader)
         
         hvt_scheduler.step()
+        current_lr = hvt_finetuner.optimizer.param_groups[0]['lr']
+        logging.info(f"Epoch {epoch+1}/100, Current LR: {current_lr:.6f}")
         
-        print(f"HVT Epoch {epoch+1}/50 - Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
-        logging.info(f"Epoch {epoch+1}/50, Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
+        print(f"HVT Epoch {epoch+1}/100 - Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
+        logging.info(f"Epoch {epoch+1}/100, Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
         
         if val_metrics["accuracy"] > best_val_acc_hvt:
             best_val_acc_hvt = val_metrics["accuracy"]
@@ -212,16 +215,17 @@ def main():
     best_model_path_baseline = "best_finetuned_baseline.pth"
     patience_counter_baseline = 0
     
-    for epoch in range(50):
+    for epoch in range(100):  # Extended to 100 epochs
         # Baseline Training loop with tqdm
         baseline_finetuner.model.train()
         train_loss = 0.0
-        with tqdm(total=len(train_loader), desc=f"Baseline Epoch {epoch+1}/50", file=sys.stdout) as pbar:
+        with tqdm(total=len(train_loader), desc=f"Baseline Epoch {epoch+1}/100", file=sys.stdout) as pbar:
             for rgb, labels in train_loader:
                 rgb, labels = rgb.to(device), labels.to(device)
                 with autocast():
                     loss = baseline_finetuner.train_step(rgb, labels)
                 scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(baseline_finetuner.model.parameters(), max_norm=1.0)  # Gradient clipping
                 scaler.step(baseline_finetuner.optimizer)
                 scaler.update()
                 baseline_finetuner.optimizer.zero_grad()
@@ -243,9 +247,11 @@ def main():
         val_metrics["f1"] /= len(val_loader)
         
         baseline_scheduler.step()
+        current_lr = baseline_finetuner.optimizer.param_groups[0]['lr']
+        logging.info(f"Epoch {epoch+1}/100, Current LR: {current_lr:.6f}")
         
-        print(f"Baseline Epoch {epoch+1}/50 - Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
-        logging.info(f"Epoch {epoch+1}/50, Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
+        print(f"Baseline Epoch {epoch+1}/100 - Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
+        logging.info(f"Epoch {epoch+1}/100, Train Loss: {train_loss:.4f}, Val Accuracy: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}")
         
         if val_metrics["accuracy"] > best_val_acc_baseline:
             best_val_acc_baseline = val_metrics["accuracy"]
